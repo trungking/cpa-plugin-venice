@@ -1,0 +1,7 @@
+.gocache/
+dist/
+*.h
+*.so
+*.dll
+*.dylib
+*.exe
