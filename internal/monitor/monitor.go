@@ -2,7 +2,6 @@ package monitor
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,6 +56,7 @@ type Record struct {
 }
 
 type Row struct {
+	ID          string   `json:"id"`
 	Source      string   `json:"source"`
 	Provider    string   `json:"provider"`
 	Model       string   `json:"model"`
@@ -74,6 +74,7 @@ type Row struct {
 	Time        string   `json:"time"`
 	Usage       Usage    `json:"usage"`
 	Cost        string   `json:"cost"`
+	Error       string   `json:"error,omitempty"`
 	Details     []Record `json:"details,omitempty"`
 }
 
@@ -188,10 +189,11 @@ func SnapshotRows(limit int, failuresOnly bool, masked bool) Snapshot {
 	if len(records) > limit {
 		records = records[len(records)-limit:]
 	}
-	groups := map[string][]Record{}
 	sourceSet := map[string]bool{}
 	failures := 0
-	for _, record := range records {
+	rows := make([]Row, 0, len(records))
+	for i := len(records) - 1; i >= 0; i-- {
+		record := records[i]
 		if record.Success {
 			if failuresOnly {
 				continue
@@ -200,20 +202,12 @@ func SnapshotRows(limit int, failuresOnly bool, masked bool) Snapshot {
 			failures++
 		}
 		sourceSet[record.Source] = true
-		key := strings.Join([]string{record.Source, record.Model, record.Effort, record.Tier}, "\x00")
-		groups[key] = append(groups[key], record)
+		rows = append(rows, rowFromRecord(record, masked))
 	}
-	rows := make([]Row, 0, len(groups))
-	for _, group := range groups {
-		rows = append(rows, rowFromRecords(group, masked))
-	}
-	sort.Slice(rows, func(i, j int) bool {
-		return rows[i].Time > rows[j].Time
-	})
 	return Snapshot{
 		Provider: "venice",
 		Summary: Summary{
-			Rows:     len(records),
+			Rows:     len(rows),
 			Failures: failures,
 			Accounts: len(sourceSet),
 		},
@@ -228,79 +222,46 @@ func ResetForTest() {
 	atomic.StoreUint64(&seq, 0)
 }
 
-func rowFromRecords(records []Record, masked bool) Row {
-	sort.Slice(records, func(i, j int) bool {
-		return records[i].StartedAt.Before(records[j].StartedAt)
-	})
-	first := records[0]
-	last := records[len(records)-1]
-	var success, failed, totalElapsed, totalTokens, totalInput, totalOutput, ttft int64
-	for _, record := range records {
-		if record.Success {
-			success++
-		} else {
-			failed++
-		}
-		totalElapsed += record.ElapsedMS
-		totalTokens += record.Usage.TotalTokens
-		totalInput += record.Usage.InputTokens
-		totalOutput += record.Usage.OutputTokens
-		ttft = record.TTFTMS
-	}
-	calls := success + failed
-	elapsed := totalElapsed / maxInt64(1, calls)
+func rowFromRecord(record Record, masked bool) Row {
+	success := int64(0)
+	failed := int64(0)
 	successRate := 0.0
-	if calls > 0 {
-		successRate = float64(success) / float64(calls) * 100
+	if record.Success {
+		success = 1
+		successRate = 100
+	} else {
+		failed = 1
 	}
 	tps := 0.0
-	if totalElapsed > 0 {
-		tps = float64(totalTokens) / (float64(totalElapsed) / 1000)
+	if record.ElapsedMS > 0 {
+		tps = float64(record.Usage.TotalTokens) / (float64(record.ElapsedMS) / 1000)
 	}
-	details := append([]Record(nil), records...)
-	if len(details) > 5 {
-		details = details[len(details)-5:]
-	}
+	detail := record
 	if masked {
-		for i := range details {
-			details[i].Source = maskSource(details[i].Source)
-		}
+		detail.Source = maskSource(detail.Source)
 	}
 	return Row{
-		Source:      chooseSource(first.Source, masked),
+		ID:          record.ID,
+		Source:      chooseSource(record.Source, masked),
 		Provider:    "venice",
-		Model:       first.Model,
-		Effort:      first.Effort,
-		Tier:        first.Tier,
-		Recent:      recent(records, 5),
-		Status:      last.Status,
+		Model:       record.Model,
+		Effort:      record.Effort,
+		Tier:        record.Tier,
+		Recent:      []bool{record.Success},
+		Status:      record.Status,
 		SuccessRate: successRate,
-		Calls:       calls,
+		Calls:       1,
 		Success:     success,
 		Failed:      failed,
 		TPS:         tps,
-		TTFTMS:      ttft,
-		ElapsedMS:   elapsed,
-		Time:        last.EndedAt.Format(time.RFC3339),
-		Usage: Usage{
-			InputTokens:  totalInput,
-			OutputTokens: totalOutput,
-			TotalTokens:  totalTokens,
-		},
-		Cost:    "-",
-		Details: details,
+		TTFTMS:      record.TTFTMS,
+		ElapsedMS:   record.ElapsedMS,
+		Time:        record.EndedAt.Format(time.RFC3339Nano),
+		Usage:       record.Usage,
+		Cost:        "-",
+		Error:       record.Error,
+		Details:     []Record{detail},
 	}
-}
-
-func recent(records []Record, count int) []bool {
-	if len(records) > count {
-		records = records[len(records)-count:]
-	}
-	out := make([]bool, 0, count)
-	for _, record := range records {
-		out = append(out, record.Success)
-	}
-	return out
 }
 
 func chooseSource(source string, masked bool) string {
@@ -330,11 +291,4 @@ func statusText(success bool) string {
 		return "Success"
 	}
 	return "Failed"
-}
-
-func maxInt64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
 }
