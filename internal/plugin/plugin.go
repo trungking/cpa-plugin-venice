@@ -34,7 +34,7 @@ func Build(configYAML []byte) pluginapi.Plugin {
 	return pluginapi.Plugin{
 		Metadata: pluginapi.Metadata{
 			Name:             "Venice Provider",
-			Version:          "1.0.6",
+			Version:          "1.0.7",
 			Author:           "router-for-me",
 			GitHubRepository: "https://github.com/trungking/cpa-plugin-venice",
 		},
@@ -42,7 +42,7 @@ func Build(configYAML []byte) pluginapi.Plugin {
 			AuthProvider:          p,
 			ModelProvider:         p,
 			Executor:              p,
-			ExecutorModelScope:    pluginapi.ExecutorModelScopeOAuth,
+			ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
 			ExecutorInputFormats:  []string{executorFormat},
 			ExecutorOutputFormats: []string{executorFormat},
 			CommandLinePlugin:     p,
