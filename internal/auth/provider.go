@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -20,13 +22,27 @@ import (
 
 const (
 	ProviderKey          = "venice"
+	AuthProviderKey      = "cpa-plugin-venice"
+	StorageType          = "venice"
 	clerkClientURL       = "https://clerk.venice.ai/v1/client?__clerk_api_version=2026-05-12&_clerk_js_version=6.22.0"
 	veniceUserSessionURL = "https://outerface.venice.ai/api/user/session?bustBalanceCache=true"
 	refreshLead          = 30 * time.Second
 	defaultRefreshAfter  = 10 * time.Minute
+	loginStateTTL        = 15 * time.Minute
 )
 
 type Provider struct{}
+
+type loginSession struct {
+	createdAt time.Time
+	expiresAt time.Time
+	auth      *pluginapi.AuthData
+}
+
+var loginSessions = struct {
+	sync.Mutex
+	byState map[string]loginSession
+}{byState: make(map[string]loginSession)}
 
 type Storage struct {
 	Type                   string         `json:"type,omitempty"`
@@ -63,7 +79,7 @@ type clerkClientResponse struct {
 
 func NewProvider() *Provider { return &Provider{} }
 
-func (p *Provider) Identifier() string { return ProviderKey }
+func (p *Provider) Identifier() string { return AuthProviderKey }
 
 func (p *Provider) ParseAuth(_ context.Context, req pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error) {
 	storage, errParse := ParseStorage(req.RawJSON)
@@ -77,12 +93,47 @@ func (p *Provider) ParseAuth(_ context.Context, req pluginapi.AuthParseRequest) 
 	return pluginapi.AuthParseResponse{Handled: true, Auth: auth, Auths: []pluginapi.AuthData{auth}}, nil
 }
 
-func (p *Provider) StartLogin(context.Context, pluginapi.AuthLoginStartRequest) (pluginapi.AuthLoginStartResponse, error) {
-	return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("venice browser login is available through --venice-login")
+func (p *Provider) StartLogin(_ context.Context, req pluginapi.AuthLoginStartRequest) (pluginapi.AuthLoginStartResponse, error) {
+	state, errState := newLoginState()
+	if errState != nil {
+		return pluginapi.AuthLoginStartResponse{}, errState
+	}
+	expiresAt := time.Now().Add(loginStateTTL)
+	loginSessions.Lock()
+	loginSessions.byState[state] = loginSession{createdAt: time.Now(), expiresAt: expiresAt}
+	loginSessions.Unlock()
+
+	return pluginapi.AuthLoginStartResponse{
+		Provider:  req.Provider,
+		URL:       "/v0/resource/plugins/cpa-plugin-venice/login?state=" + url.QueryEscape(state),
+		State:     state,
+		ExpiresAt: expiresAt,
+	}, nil
 }
 
-func (p *Provider) PollLogin(context.Context, pluginapi.AuthLoginPollRequest) (pluginapi.AuthLoginPollResponse, error) {
-	return pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusError, Message: "venice browser login is available through --venice-login"}, nil
+func (p *Provider) PollLogin(_ context.Context, req pluginapi.AuthLoginPollRequest) (pluginapi.AuthLoginPollResponse, error) {
+	state := strings.TrimSpace(req.State)
+	if state == "" {
+		return pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusError, Message: "missing Venice login state"}, nil
+	}
+	now := time.Now()
+	loginSessions.Lock()
+	session, ok := loginSessions.byState[state]
+	if ok && now.After(session.expiresAt) {
+		delete(loginSessions.byState, state)
+		ok = false
+	}
+	if ok && session.auth != nil {
+		auth := *session.auth
+		delete(loginSessions.byState, state)
+		loginSessions.Unlock()
+		return pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusSuccess, Auth: auth, Message: "Venice account saved"}, nil
+	}
+	loginSessions.Unlock()
+	if !ok {
+		return pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusError, Message: "Venice login expired. Start login again."}, nil
+	}
+	return pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: "Waiting for Venice cookie"}, nil
 }
 
 func (p *Provider) RefreshAuth(ctx context.Context, req pluginapi.AuthRefreshRequest) (pluginapi.AuthRefreshResponse, error) {
@@ -109,11 +160,11 @@ func ParseStorage(raw []byte) (*Storage, error) {
 		return nil, fmt.Errorf("decode venice auth: %w", errUnmarshal)
 	}
 	providerType := strings.ToLower(strings.TrimSpace(stringFromMap(decoded, "type")))
-	if providerType != ProviderKey && providerType != "venice-web" {
+	if providerType != ProviderKey && providerType != AuthProviderKey && providerType != StorageType && providerType != "venice-web" {
 		return nil, nil
 	}
 	storage := Storage{
-		Type:                   ProviderKey,
+		Type:                   StorageType,
 		Email:                  strings.TrimSpace(stringFromMap(decoded, "email")),
 		Prefix:                 strings.TrimSpace(stringFromMap(decoded, "prefix")),
 		Cookie:                 NormalizeCookieInput(stringFromMap(decoded, "cookie")),
@@ -137,7 +188,7 @@ func ParseStorage(raw []byte) (*Storage, error) {
 }
 
 func AuthData(id string, storage Storage) pluginapi.AuthData {
-	storage.Type = ProviderKey
+	storage.Type = StorageType
 	fileName := filepath.Base(strings.TrimSpace(id))
 	if fileName == "" || fileName == "." {
 		fileName = defaultFileName(storage)
@@ -150,7 +201,7 @@ func AuthData(id string, storage Storage) pluginapi.AuthData {
 	if metadata == nil {
 		metadata = make(map[string]any)
 	}
-	metadata["type"] = ProviderKey
+	metadata["type"] = StorageType
 	if storage.Email != "" {
 		metadata["email"] = storage.Email
 	}
@@ -177,6 +228,30 @@ func AuthData(id string, storage Storage) pluginapi.AuthData {
 		Attributes:       map[string]string{"email": storage.Email},
 		NextRefreshAfter: NextRefreshAfter(storage, time.Now()),
 	}
+}
+
+func CompleteLogin(state string, auth pluginapi.AuthData) bool {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return false
+	}
+	loginSessions.Lock()
+	defer loginSessions.Unlock()
+	session, ok := loginSessions.byState[state]
+	if !ok || time.Now().After(session.expiresAt) {
+		return false
+	}
+	session.auth = &auth
+	loginSessions.byState[state] = session
+	return true
+}
+
+func newLoginState() (string, error) {
+	var raw [18]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("create Venice login state: %w", err)
+	}
+	return "venice-" + base64.RawURLEncoding.EncodeToString(raw[:]), nil
 }
 
 func RefreshStorage(ctx context.Context, client pluginapi.HostHTTPClient, storage *Storage) error {

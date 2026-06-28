@@ -65,7 +65,7 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return pluginapi.ExecutorResponse{}, fmt.Errorf("venice chat failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(resp.Body)))
 	}
-	payload := aggregateOpenAIResponse(resp.Body, model, openReq.Stream)
+	payload := aggregateOpenAIResponse(resp.Body, model, openReq)
 	return pluginapi.ExecutorResponse{
 		Payload: payload,
 		Headers: http.Header{"Content-Type": []string{"application/json"}},
@@ -77,7 +77,7 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 	if errStorage != nil {
 		return pluginapi.ExecutorStreamResponse{}, errStorage
 	}
-	_, veniceBody, model, errBuild := buildVeniceRequest(req)
+	openReq, veniceBody, model, errBuild := buildVeniceRequest(req)
 	if errBuild != nil {
 		return pluginapi.ExecutorStreamResponse{}, errBuild
 	}
@@ -95,7 +95,7 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 	}
 	return pluginapi.ExecutorStreamResponse{
 		Headers: http.Header{"Content-Type": []string{"text/event-stream"}},
-		Chunks:  openAIStreamChunks(ctx, resp.Chunks, model),
+		Chunks:  openAIStreamChunks(ctx, resp.Chunks, model, openReq),
 	}, nil
 }
 
@@ -239,7 +239,7 @@ func normalizeContent(value any) string {
 	}
 }
 
-func aggregateOpenAIResponse(body []byte, model string, stream bool) []byte {
+func aggregateOpenAIResponse(body []byte, model string, req openAIRequest) []byte {
 	content := strings.Builder{}
 	reasoning := strings.Builder{}
 	upstreamID := "chatcmpl-" + randomID()
@@ -263,6 +263,8 @@ func aggregateOpenAIResponse(body []byte, model string, stream bool) []byte {
 	if reasoning.Len() > 0 {
 		message["reasoning_content"] = reasoning.String()
 	}
+	promptTokens := estimateRequestTokens(req)
+	completionTokens := estimateTokens(content.String()) + estimateTokens(reasoning.String())
 	out := map[string]any{
 		"id":      upstreamID,
 		"object":  "chat.completion",
@@ -273,18 +275,20 @@ func aggregateOpenAIResponse(body []byte, model string, stream bool) []byte {
 			"message":       message,
 			"finish_reason": "stop",
 		}},
-		"usage": map[string]int{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+		"usage": openAIUsage(promptTokens, completionTokens),
 	}
 	raw, _ := json.Marshal(out)
 	return raw
 }
 
-func openAIStreamChunks(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk, model string) <-chan pluginapi.ExecutorStreamChunk {
+func openAIStreamChunks(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk, model string, req openAIRequest) <-chan pluginapi.ExecutorStreamChunk {
 	out := make(chan pluginapi.ExecutorStreamChunk)
 	go func() {
 		defer close(out)
 		streamID := "chatcmpl-" + randomID()
 		created := time.Now().Unix()
+		content := strings.Builder{}
+		reasoning := strings.Builder{}
 		emit := func(payload map[string]any) bool {
 			raw, _ := json.Marshal(payload)
 			select {
@@ -307,6 +311,11 @@ func openAIStreamChunks(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk
 					if !emit(openAIStreamPayload(streamID, created, model, map[string]any{}, "stop")) {
 						return
 					}
+					promptTokens := estimateRequestTokens(req)
+					completionTokens := estimateTokens(content.String()) + estimateTokens(reasoning.String())
+					if !emit(openAIStreamUsagePayload(streamID, created, model, openAIUsage(promptTokens, completionTokens))) {
+						return
+					}
 					out <- pluginapi.ExecutorStreamChunk{Payload: []byte("[DONE]")}
 					return
 				}
@@ -325,9 +334,11 @@ func openAIStreamChunks(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk
 					delta := make(map[string]any)
 					if event.Content != "" {
 						delta["content"] = event.Content
+						content.WriteString(event.Content)
 					}
 					if event.ReasoningContent != "" {
 						delta["reasoning_content"] = event.ReasoningContent
+						reasoning.WriteString(event.ReasoningContent)
 					}
 					if len(delta) == 0 {
 						continue
@@ -342,6 +353,17 @@ func openAIStreamChunks(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk
 	return out
 }
 
+func openAIStreamUsagePayload(id string, created int64, model string, usage map[string]int) map[string]any {
+	return map[string]any{
+		"id":      id,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]any{},
+		"usage":   usage,
+	}
+}
+
 func openAIStreamPayload(id string, created int64, model string, delta map[string]any, finishReason any) map[string]any {
 	return map[string]any{
 		"id":      id,
@@ -354,6 +376,37 @@ func openAIStreamPayload(id string, created int64, model string, delta map[strin
 			"finish_reason": finishReason,
 		}},
 	}
+}
+
+func openAIUsage(promptTokens, completionTokens int) map[string]int {
+	if promptTokens < 0 {
+		promptTokens = 0
+	}
+	if completionTokens < 0 {
+		completionTokens = 0
+	}
+	return map[string]int{
+		"prompt_tokens":     promptTokens,
+		"completion_tokens": completionTokens,
+		"total_tokens":      promptTokens + completionTokens,
+	}
+}
+
+func estimateRequestTokens(req openAIRequest) int {
+	total := estimateTokens(req.Model)
+	for _, message := range req.Messages {
+		total += estimateTokens(message.Role)
+		total += estimateTokens(normalizeContent(message.Content))
+	}
+	return total
+}
+
+func estimateTokens(text string) int {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return 0
+	}
+	return max(1, (len([]rune(text))+3)/4)
 }
 
 func parseVeniceLine(line string) (veniceLine, bool) {

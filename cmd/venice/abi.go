@@ -55,6 +55,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	authpkg "github.com/trungking/cpa-plugin-venice/internal/auth"
 	Venice "github.com/trungking/cpa-plugin-venice/internal/plugin"
 )
 
@@ -260,7 +261,9 @@ func handleABIMethod(ctx context.Context, method string, request []byte) ([]byte
 		return nil, errPlugin
 	}
 	switch method {
-	case pluginabi.MethodAuthIdentifier, pluginabi.MethodExecutorIdentifier, pluginabi.MethodThinkingIdentifier:
+	case pluginabi.MethodAuthIdentifier:
+		return abiOKEnvelope(abiIdentifierResponse{Identifier: authpkg.AuthProviderKey})
+	case pluginabi.MethodExecutorIdentifier, pluginabi.MethodThinkingIdentifier:
 		return abiOKEnvelope(abiIdentifierResponse{Identifier: p.Identifier()})
 	case pluginabi.MethodAuthParse:
 		var req pluginapi.AuthParseRequest

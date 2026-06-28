@@ -18,7 +18,6 @@ import (
 const (
 	accountsPath     = "/plugins/venice/accounts"
 	accountsJSONPath = "/plugins/venice/accounts.json"
-	authURLPath      = "/cpa-plugin-venice-auth-url"
 	loginPath        = "/cpa-plugin-venice-login"
 	resourcePath     = "/accounts"
 	resourceLogin    = "/login"
@@ -72,11 +71,6 @@ func (p *Provider) RegisterManagement(context.Context, pluginapi.ManagementRegis
 			Handler:     p,
 		}, {
 			Method:      http.MethodGet,
-			Path:        authURLPath,
-			Description: "Return the Venice cookie login page URL.",
-			Handler:     p,
-		}, {
-			Method:      http.MethodGet,
 			Path:        loginPath,
 			Description: "Venice cookie login form.",
 			Handler:     p,
@@ -104,14 +98,11 @@ func (p *Provider) HandleManagement(ctx context.Context, req pluginapi.Managemen
 }
 
 func (p *Provider) HandleManagementWithHost(ctx context.Context, req pluginapi.ManagementRequest, host HostClient) (pluginapi.ManagementResponse, error) {
-	if isAuthURLPath(req.Path) {
-		return authURLResponse(req), nil
-	}
 	if isLoginPath(req.Path) {
 		if strings.EqualFold(req.Method, http.MethodPost) {
 			return p.saveLogin(ctx, req, host), nil
 		}
-		return loginFormResponse("", "", ""), nil
+		return loginFormResponse("", "", strings.TrimSpace(req.Query.Get("state")), ""), nil
 	}
 	accounts, err := p.accounts(ctx, host)
 	if err != nil {
@@ -123,91 +114,70 @@ func (p *Provider) HandleManagementWithHost(ctx context.Context, req pluginapi.M
 	return htmlResponse(accounts), nil
 }
 
-func isAuthURLPath(path string) bool {
-	path = strings.TrimRight(strings.TrimSpace(path), "/")
-	return strings.HasSuffix(path, authURLPath)
-}
-
 func isLoginPath(path string) bool {
 	path = strings.TrimRight(strings.TrimSpace(path), "/")
 	return strings.HasSuffix(path, loginPath) || strings.HasSuffix(path, resourceLogin)
 }
 
-func authURLResponse(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	loginURL := externalBase(req) + "/v0/resource/plugins/cpa-plugin-venice/login"
-	return jsonResponse(http.StatusOK, map[string]any{
-		"status": "ok",
-		"url":    loginURL,
-	})
-}
-
-func externalBase(req pluginapi.ManagementRequest) string {
-	host := strings.TrimSpace(req.Headers.Get("X-Forwarded-Host"))
-	if host == "" {
-		host = strings.TrimSpace(req.Headers.Get("Host"))
-	}
-	if host == "" {
-		return ""
-	}
-	proto := strings.TrimSpace(req.Headers.Get("X-Forwarded-Proto"))
-	if proto == "" {
-		proto = "https"
-		if strings.HasPrefix(host, "127.0.0.1") || strings.HasPrefix(host, "localhost") {
-			proto = "http"
-		}
-	}
-	return proto + "://" + host
-}
-
 func (p *Provider) saveLogin(ctx context.Context, req pluginapi.ManagementRequest, host HostClient) pluginapi.ManagementResponse {
-	name, cookie, errInput := parseLoginInput(req)
+	name, cookie, state, errInput := parseLoginInput(req)
 	if errInput != nil {
-		return loginFormResponse(name, cookie, errInput.Error())
+		return loginFormResponse(name, cookie, state, errInput.Error())
 	}
 	if host == nil || host.HTTPClient() == nil {
-		return loginFormResponse(name, cookie, "CLIProxyAPI host callbacks are unavailable for saving Venice auth.")
+		return loginFormResponse(name, cookie, state, "CLIProxyAPI host callbacks are unavailable for saving Venice auth.")
 	}
-	storage := authpkg.Storage{Type: authpkg.ProviderKey, Cookie: authpkg.NormalizeCookieInput(cookie)}
+	storage := authpkg.Storage{Type: authpkg.StorageType, Cookie: authpkg.NormalizeCookieInput(cookie)}
 	if storage.Cookie == "" || !strings.Contains(storage.Cookie, "__client=") {
-		return loginFormResponse(name, cookie, "Venice __client cookie is required.")
+		return loginFormResponse(name, cookie, state, "Venice __client cookie is required.")
 	}
 	if errRefresh := authpkg.RefreshStorage(ctx, host.HTTPClient(), &storage); errRefresh != nil {
-		return loginFormResponse(name, cookie, "Venice account validation failed: "+errRefresh.Error())
+		return loginFormResponse(name, cookie, state, "Venice account validation failed: "+errRefresh.Error())
 	}
 	auth := authpkg.AuthData("", storage)
 	fileName := auth.FileName
 	if strings.TrimSpace(name) != "" {
 		fileName = loginFileName(name)
+		auth.FileName = fileName
+		auth.ID = strings.TrimSuffix(fileName, ".json")
+	}
+	if state != "" {
+		if !authpkg.CompleteLogin(state, auth) {
+			return loginFormResponse(name, "", state, "Venice login session expired. Start Venice Provider Login again.")
+		}
+		return loginSuccessResponse(storage.Email, fileName)
 	}
 	saved, errSave := host.SaveAuth(ctx, fileName, auth.StorageJSON)
 	if errSave != nil {
-		return loginFormResponse(name, "", "Saving Venice auth failed: "+errSave.Error())
+		return loginFormResponse(name, "", state, "Saving Venice auth failed: "+errSave.Error())
 	}
 	return loginSuccessResponse(storage.Email, saved.Name)
 }
 
-func parseLoginInput(req pluginapi.ManagementRequest) (string, string, error) {
+func parseLoginInput(req pluginapi.ManagementRequest) (string, string, string, error) {
 	contentType := strings.ToLower(req.Headers.Get("Content-Type"))
 	if strings.Contains(contentType, "application/json") {
 		var payload struct {
 			Name   string `json:"name"`
 			Cookie string `json:"cookie"`
+			State  string `json:"state"`
 		}
 		if err := json.Unmarshal(req.Body, &payload); err != nil {
-			return "", "", fmt.Errorf("invalid JSON body")
+			return "", "", "", fmt.Errorf("invalid JSON body")
 		}
-		return strings.TrimSpace(payload.Name), strings.TrimSpace(payload.Cookie), nil
+		return strings.TrimSpace(payload.Name), strings.TrimSpace(payload.Cookie), strings.TrimSpace(firstNonEmpty(payload.State, req.Query.Get("state"))), nil
 	}
 	values, err := url.ParseQuery(string(req.Body))
 	if err != nil {
-		return "", "", fmt.Errorf("invalid form body")
+		return "", "", "", fmt.Errorf("invalid form body")
 	}
 	name := strings.TrimSpace(values.Get("name"))
 	cookie := strings.TrimSpace(values.Get("cookie"))
+	state := strings.TrimSpace(firstNonEmpty(values.Get("state"), req.Query.Get("state")))
 	if cookie == "" {
-		return name, cookie, fmt.Errorf("paste a Venice __client cookie or Cookie header")
+		return name, cookie, state, fmt.Errorf("paste a Venice __client cookie or Cookie header")
 	}
-	return name, cookie, nil
+	return name, cookie, state, nil
 }
 
 func loginFileName(value string) string {
@@ -230,7 +200,7 @@ func loginFileName(value string) string {
 	return out
 }
 
-func loginFormResponse(name, cookie, message string) pluginapi.ManagementResponse {
+func loginFormResponse(name, cookie, state, message string) pluginapi.ManagementResponse {
 	var body strings.Builder
 	body.WriteString("<!doctype html><html><head><meta charset=\"utf-8\"><title>Venice Login</title>")
 	body.WriteString("<style>:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;padding:24px;background:#101723;color:#e7eaf1;font-family:system-ui,-apple-system,Segoe UI,sans-serif}.wrap{max-width:980px;margin:0 auto}.panel{border:1px solid #293346;background:#151c2b;border-radius:10px;padding:22px}h1{font-size:22px;margin:0 0 14px}.hint{color:#a9b2c1;margin-bottom:18px;line-height:1.5}.authbox{border:1px dashed #3b465a;background:#232a39;border-radius:8px;padding:16px;margin:16px 0}.authbox .url{font-weight:900;overflow-wrap:anywhere;margin:8px 0 14px}.field{margin-top:14px}label{display:block;font-weight:800;margin-bottom:7px}input,textarea{width:100%;border:1px solid #354156;background:#0c1220;color:#f4f7fb;border-radius:8px;padding:11px;font:inherit}textarea{min-height:210px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:13px}.err{display:inline-block;border:1px solid #7f3131;background:#381b21;color:#ffd5d5;border-radius:999px;padding:7px 11px;margin-bottom:12px}.actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:18px}.btn,.linkbtn{border:1px solid #4776a8;background:#2f94ff;color:white;border-radius:11px;padding:10px 16px;font-weight:900;cursor:pointer;text-decoration:none}.linkbtn{background:#2a3345;color:#e7edf7}</style>")
@@ -242,7 +212,9 @@ func loginFormResponse(name, cookie, message string) pluginapi.ManagementRespons
 		body.WriteString(html.EscapeString(message))
 		body.WriteString("</div>")
 	}
-	body.WriteString("<form method=\"post\" action=\"/v0/management/cpa-plugin-venice-login\"><div class=\"field\"><label for=\"name\">Name (optional)</label><input id=\"name\" name=\"name\" autocomplete=\"off\" value=\"")
+	body.WriteString("<form method=\"post\" action=\"/v0/management/cpa-plugin-venice-login\"><input type=\"hidden\" name=\"state\" value=\"")
+	body.WriteString(html.EscapeString(state))
+	body.WriteString("\"><div class=\"field\"><label for=\"name\">Name (optional)</label><input id=\"name\" name=\"name\" autocomplete=\"off\" value=\"")
 	body.WriteString(html.EscapeString(name))
 	body.WriteString("\"></div><div class=\"field\"><label for=\"cookie\">Cookie</label><textarea id=\"cookie\" name=\"cookie\" spellcheck=\"false\">")
 	body.WriteString(html.EscapeString(cookie))

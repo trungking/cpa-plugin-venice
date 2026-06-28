@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	authpkg "github.com/trungking/cpa-plugin-venice/internal/auth"
 )
 
 func TestHandleManagementReturnsVeniceAccountQuota(t *testing.T) {
@@ -66,15 +67,11 @@ func TestHandleManagementReturnsVeniceAccountQuota(t *testing.T) {
 	}
 }
 
-func TestAuthURLRouteReturnsCookieLoginURL(t *testing.T) {
+func TestLoginFormPreservesOAuthState(t *testing.T) {
 	resp, err := New().HandleManagementWithHost(context.Background(), pluginapi.ManagementRequest{
 		Method: http.MethodGet,
-		Path:   "/v0/management/cpa-plugin-venice-auth-url",
-		Headers: http.Header{
-			"Host":              []string{"stats.acbpro.com"},
-			"X-Forwarded-Proto": []string{"https"},
-			"Accept":            []string{"application/json"},
-		},
+		Path:   "/v0/resource/plugins/cpa-plugin-venice/login",
+		Query:  url.Values{"state": []string{"venice-test-state"}},
 	}, &fakeHost{})
 	if err != nil {
 		t.Fatalf("HandleManagementWithHost error: %v", err)
@@ -82,18 +79,8 @@ func TestAuthURLRouteReturnsCookieLoginURL(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("StatusCode = %d", resp.StatusCode)
 	}
-	var payload struct {
-		URL   string `json:"url"`
-		State string `json:"state"`
-	}
-	if err := json.Unmarshal(resp.Body, &payload); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if payload.URL != "https://stats.acbpro.com/v0/resource/plugins/cpa-plugin-venice/login" {
-		t.Fatalf("url = %q", payload.URL)
-	}
-	if payload.State != "" {
-		t.Fatalf("state = %q", payload.State)
+	if !strings.Contains(string(resp.Body), `name="state" value="venice-test-state"`) {
+		t.Fatalf("form did not preserve state: %s", string(resp.Body))
 	}
 }
 
@@ -132,6 +119,43 @@ func TestLoginPostValidatesAndSavesAuth(t *testing.T) {
 	}
 	if containsSecret(string(resp.Body)) {
 		t.Fatalf("response leaked secret fields: %s", string(resp.Body))
+	}
+}
+
+func TestLoginPostWithOAuthStateCompletesPollWithoutDirectSave(t *testing.T) {
+	authProvider := authpkg.NewProvider()
+	start, err := authProvider.StartLogin(context.Background(), pluginapi.AuthLoginStartRequest{Provider: "cpa-plugin-venice"})
+	if err != nil {
+		t.Fatalf("StartLogin error: %v", err)
+	}
+	host := &fakeHost{httpClient: fakeHTTPClient{}}
+	form := url.Values{}
+	form.Set("state", start.State)
+	form.Set("cookie", "__client=abc")
+	resp, err := New().HandleManagementWithHost(context.Background(), pluginapi.ManagementRequest{
+		Method:  http.MethodPost,
+		Path:    "/v0/management/cpa-plugin-venice-login",
+		Headers: http.Header{"Content-Type": []string{"application/x-www-form-urlencoded"}},
+		Body:    []byte(form.Encode()),
+	}, host)
+	if err != nil {
+		t.Fatalf("HandleManagementWithHost error: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d", resp.StatusCode)
+	}
+	if len(host.savedJSON) != 0 {
+		t.Fatalf("OAuth form should complete poll state, not save directly")
+	}
+	poll, err := authProvider.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{State: start.State})
+	if err != nil {
+		t.Fatalf("PollLogin error: %v", err)
+	}
+	if poll.Status != pluginapi.AuthLoginStatusSuccess || poll.Auth.Provider != "venice" {
+		t.Fatalf("poll = %#v", poll)
+	}
+	if !strings.Contains(string(poll.Auth.StorageJSON), `"type":"venice"`) {
+		t.Fatalf("storage JSON = %s", string(poll.Auth.StorageJSON))
 	}
 }
 

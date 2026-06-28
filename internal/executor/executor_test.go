@@ -57,7 +57,8 @@ func TestOpenAIStreamChunksConvertsVeniceStream(t *testing.T) {
 	close(in)
 
 	var frames []string
-	for chunk := range openAIStreamChunks(context.Background(), in, "zai-org-glm-5.2") {
+	req := openAIRequest{Model: "zai-org-glm-5.2", Messages: []openAIMessage{{Role: "user", Content: "hello"}}}
+	for chunk := range openAIStreamChunks(context.Background(), in, "zai-org-glm-5.2", req) {
 		if chunk.Err != nil {
 			t.Fatalf("stream chunk error: %v", chunk.Err)
 		}
@@ -76,6 +77,9 @@ func TestOpenAIStreamChunksConvertsVeniceStream(t *testing.T) {
 	if !strings.Contains(joined, `"content":"hel"`) || !strings.Contains(joined, `"content":"lo"`) {
 		t.Fatalf("stream did not contain content deltas: %s", joined)
 	}
+	if !strings.Contains(joined, `"usage"`) || !strings.Contains(joined, `"total_tokens"`) {
+		t.Fatalf("stream did not contain usage chunk: %s", joined)
+	}
 	if !strings.Contains(joined, `[DONE]`) {
 		t.Fatalf("stream did not finish with DONE: %s", joined)
 	}
@@ -85,7 +89,8 @@ func TestAggregateOpenAIResponse(t *testing.T) {
 	raw := []byte(`{"kind":"meta","completion_id":"upstream-id"}` + "\n" +
 		`{"kind":"content","content":"hel","reasoning_content":"r1"}` + "\n" +
 		`{"kind":"content","content":"lo","reasoning_content":"r2"}` + "\n")
-	out := aggregateOpenAIResponse(raw, "zai-org-glm-5.2", false)
+	req := openAIRequest{Model: "zai-org-glm-5.2", Messages: []openAIMessage{{Role: "user", Content: "hello"}}}
+	out := aggregateOpenAIResponse(raw, "zai-org-glm-5.2", req)
 	var body map[string]any
 	if err := json.Unmarshal(out, &body); err != nil {
 		t.Fatalf("decode output: %v", err)
@@ -100,5 +105,9 @@ func TestAggregateOpenAIResponse(t *testing.T) {
 	}
 	if message["reasoning_content"] != "r1r2" {
 		t.Fatalf("reasoning = %#v", message["reasoning_content"])
+	}
+	usage := body["usage"].(map[string]any)
+	if usage["total_tokens"].(float64) <= 0 {
+		t.Fatalf("usage = %#v, want estimated tokens", usage)
 	}
 }
