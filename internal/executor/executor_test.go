@@ -85,8 +85,8 @@ func TestOpenAIStreamChunksConvertsVeniceStream(t *testing.T) {
 	if !strings.Contains(joined, `"usage"`) || !strings.Contains(joined, `"total_tokens"`) {
 		t.Fatalf("stream did not contain usage chunk: %s", joined)
 	}
-	if !strings.Contains(joined, `[DONE]`) {
-		t.Fatalf("stream did not finish with DONE: %s", joined)
+	if strings.Contains(joined, `[DONE]`) {
+		t.Fatalf("plugin stream should leave the terminal DONE marker to the host: %s", joined)
 	}
 }
 

@@ -357,7 +357,6 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 					if span != nil {
 						span.Finish(monitor.Result{Success: true, OutputTokens: int64(completionTokens), TotalTokens: int64(promptTokens + completionTokens)})
 					}
-					out <- pluginapi.ExecutorStreamChunk{Payload: []byte("[DONE]")}
 					return
 				}
 				if chunk.Err != nil {
