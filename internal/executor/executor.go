@@ -227,7 +227,7 @@ func buildVeniceRequest(req pluginapi.ExecutorRequest) (openAIRequest, []byte, s
 		"isCharacter":                  false,
 		"modelId":                      veniceModel,
 		"prompt":                       prompt,
-		"reasoning":                    true,
+		"reasoning":                    len(openReq.Tools) == 0,
 		"requestId":                    randomID(),
 		"simpleMode":                   false,
 		"systemPrompt":                 systemPrompt,
@@ -269,8 +269,23 @@ func splitMessages(req openAIRequest) (string, []map[string]string) {
 	}
 	if instructions := toolInstructions(req); instructions != "" {
 		systemParts = append(systemParts, instructions)
+		prompt = appendToolInstructionsToLastUser(prompt, instructions)
 	}
 	return strings.Join(systemParts, "\n\n"), maybePrefixReasoning(prompt, len(req.Tools) == 0)
+}
+
+func appendToolInstructionsToLastUser(prompt []map[string]string, instructions string) []map[string]string {
+	instructions = strings.TrimSpace(instructions)
+	if instructions == "" {
+		return prompt
+	}
+	for i := len(prompt) - 1; i >= 0; i-- {
+		if prompt[i]["role"] == "user" {
+			prompt[i]["content"] = strings.TrimSpace(prompt[i]["content"] + "\n\n" + instructions)
+			return prompt
+		}
+	}
+	return append(prompt, map[string]string{"role": "user", "content": instructions})
 }
 
 func maybePrefixReasoning(prompt []map[string]string, enabled bool) []map[string]string {
@@ -332,9 +347,10 @@ func toolInstructions(req openAIRequest) string {
 	toolsRaw, _ := json.Marshal(req.Tools)
 	choiceRaw, _ := json.Marshal(req.ToolChoice)
 	return strings.TrimSpace(fmt.Sprintf(`Tool calling is available.
-When you need a tool, respond with exactly one JSON object and no markdown, no prose, and no surrounding text:
+If a tool is needed, respond with exactly one JSON object and no markdown, no prose, no thinking text, and no surrounding text:
 {"tool_calls":[{"name":"tool_name","arguments":{}}]}
 The "name" must exactly match one available tool name. The "arguments" value must be a JSON object matching that tool schema.
+Do not answer in natural language when the next step requires a tool. Do not describe the tool; call it with JSON.
 After tool results are provided in later messages, answer normally or request another tool with the same JSON format.
 
 Available tools:
@@ -372,12 +388,11 @@ func aggregateOpenAIResponse(body []byte, model string, req openAIRequest) []byt
 	}
 	message := map[string]any{"role": "assistant", "content": content.String()}
 	finishReason := "stop"
-	if toolCalls, ok := parseToolCalls(content.String()); ok && len(req.Tools) > 0 {
+	if toolCalls, ok := parseToolCallsFromText(content.String(), reasoning.String()); ok && len(req.Tools) > 0 {
 		message["content"] = nil
 		message["tool_calls"] = toolCalls
 		finishReason = "tool_calls"
-	}
-	if reasoning.Len() > 0 {
+	} else if reasoning.Len() > 0 {
 		message["reasoning_content"] = reasoning.String()
 	}
 	promptTokens := estimateRequestTokens(req)
@@ -508,7 +523,7 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 }
 
 func emitBufferedToolAwareStream(emit func(map[string]any) bool, streamID string, created int64, model string, req openAIRequest, content, reasoning string) bool {
-	if toolCalls, ok := parseToolCalls(content); ok && len(req.Tools) > 0 {
+	if toolCalls, ok := parseToolCallsFromText(content, reasoning); ok && len(req.Tools) > 0 {
 		for i, call := range toolCalls {
 			delta := map[string]any{
 				"tool_calls": []map[string]any{{
@@ -540,6 +555,15 @@ func emitBufferedToolAwareStream(emit func(map[string]any) bool, streamID string
 		}
 	}
 	return emit(openAIStreamPayload(streamID, created, model, map[string]any{}, "stop"))
+}
+
+func parseToolCallsFromText(content, reasoning string) ([]openAIToolCall, bool) {
+	for _, text := range []string{content, reasoning, strings.TrimSpace(content + "\n" + reasoning)} {
+		if calls, ok := parseToolCalls(text); ok {
+			return calls, true
+		}
+	}
+	return nil, false
 }
 
 func usageFromOpenAIResponse(payload []byte) monitor.Usage {
@@ -841,10 +865,16 @@ func normalizeToolCall(value any, _ int) (openAIToolCall, bool) {
 	if args == nil {
 		args = item["args"]
 	}
+	if args == nil {
+		args = item["parameters"]
+	}
 	if fn, ok := item["function"].(map[string]any); ok {
 		name = firstNonEmpty(stringFromAny(fn["name"]), name)
 		if fn["arguments"] != nil {
 			args = fn["arguments"]
+		}
+		if args == nil {
+			args = fn["parameters"]
 		}
 	}
 	name = strings.TrimSpace(name)

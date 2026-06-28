@@ -78,10 +78,16 @@ func TestBuildVeniceRequestAddsToolInstructions(t *testing.T) {
 	if !strings.Contains(systemPrompt, "Tool calling is available") || !strings.Contains(systemPrompt, "list_files") {
 		t.Fatalf("systemPrompt missing tool instructions: %s", systemPrompt)
 	}
+	if body["reasoning"] != false {
+		t.Fatalf("tool-enabled request should disable Venice reasoning: %#v", body["reasoning"])
+	}
 	prompt := body["prompt"].([]any)
 	last := prompt[len(prompt)-1].(map[string]any)
 	if strings.HasPrefix(last["content"].(string), "/think ") {
 		t.Fatalf("tool-enabled request should not force /think: %#v", last["content"])
+	}
+	if !strings.Contains(last["content"].(string), "no thinking text") || !strings.Contains(last["content"].(string), "list_files") {
+		t.Fatalf("last user prompt missing tool instructions: %#v", last["content"])
 	}
 }
 
@@ -159,6 +165,36 @@ func TestOpenAIStreamChunksConvertsToolCall(t *testing.T) {
 	}
 	if strings.Contains(joined, `"content":"{\\"tool_calls\\"`) {
 		t.Fatalf("stream leaked tool JSON as content: %s", joined)
+	}
+}
+
+func TestOpenAIStreamChunksConvertsToolCallFromReasoning(t *testing.T) {
+	in := make(chan pluginapi.HTTPStreamChunk, 1)
+	in <- pluginapi.HTTPStreamChunk{Payload: []byte(
+		`data: {"kind":"content","reasoning_content":"{\"tool_calls\":[{\"name\":\"list_files\",\"parameters\":{\"path\":\".\"}}]}"}` + "\n",
+	)}
+	close(in)
+
+	var frames []string
+	req := openAIRequest{
+		Model:    "zai-org-glm-5.2",
+		Messages: []openAIMessage{{Role: "user", Content: "inspect"}},
+		Tools: []json.RawMessage{
+			json.RawMessage(`{"type":"function","function":{"name":"list_files"}}`),
+		},
+	}
+	for chunk := range openAIStreamChunks(context.Background(), in, "zai-org-glm-5.2", req) {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+		frames = append(frames, string(chunk.Payload))
+	}
+	joined := strings.Join(frames, "")
+	if !strings.Contains(joined, `"tool_calls"`) || !strings.Contains(joined, `"name":"list_files"`) {
+		t.Fatalf("stream did not contain reasoning tool call delta: %s", joined)
+	}
+	if strings.Contains(joined, `"reasoning_content"`) {
+		t.Fatalf("stream leaked reasoning tool JSON: %s", joined)
 	}
 }
 
