@@ -95,7 +95,11 @@ func TestBuildVeniceRequestAddsToolInstructions(t *testing.T) {
 
 func TestToolRepairSettingAddsStrictInstruction(t *testing.T) {
 	settingspkg.Set(settingspkg.Config{ToolRepairEnabled: true})
-	t.Cleanup(func() { settingspkg.Set(settingspkg.Config{}) })
+	settingspkg.ResetStatsForTest()
+	t.Cleanup(func() {
+		settingspkg.Set(settingspkg.Config{})
+		settingspkg.ResetStatsForTest()
+	})
 	req := pluginapi.ExecutorRequest{
 		Model: "zai-org-glm-5-2",
 		Payload: []byte(`{
@@ -116,6 +120,9 @@ func TestToolRepairSettingAddsStrictInstruction(t *testing.T) {
 	systemPrompt := body["systemPrompt"].(string)
 	if !strings.Contains(systemPrompt, "Plugin tool-call repair is enabled") {
 		t.Fatalf("systemPrompt missing repair mode: %s", systemPrompt)
+	}
+	if got := settingspkg.SnapshotStats().ToolRepairApplied; got != 1 {
+		t.Fatalf("ToolRepairApplied = %d", got)
 	}
 }
 
@@ -164,6 +171,8 @@ func TestOpenAIStreamChunksConvertsVeniceStream(t *testing.T) {
 }
 
 func TestOpenAIStreamChunksConvertsToolCall(t *testing.T) {
+	settingspkg.ResetStatsForTest()
+	t.Cleanup(settingspkg.ResetStatsForTest)
 	in := make(chan pluginapi.HTTPStreamChunk, 1)
 	in <- pluginapi.HTTPStreamChunk{Payload: []byte(
 		`data: {"kind":"content","content":"{\"tool_calls\":[{\"name\":\"list_files\",\"arguments\":{\"path\":\".\"}}]}"}` + "\n",
@@ -193,6 +202,10 @@ func TestOpenAIStreamChunksConvertsToolCall(t *testing.T) {
 	}
 	if strings.Contains(joined, `"content":"{\\"tool_calls\\"`) {
 		t.Fatalf("stream leaked tool JSON as content: %s", joined)
+	}
+	stats := settingspkg.SnapshotStats()
+	if stats.ToolCallConversions != 1 || stats.ToolCallsEmitted != 1 {
+		t.Fatalf("stats = %#v", stats)
 	}
 }
 

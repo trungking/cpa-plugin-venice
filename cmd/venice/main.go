@@ -1,5 +1,5 @@
 package main
 
-var pluginVersion = "1.0.18"
+var pluginVersion = "1.0.19"
 
 func main() {}

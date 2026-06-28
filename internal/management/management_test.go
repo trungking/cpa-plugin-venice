@@ -118,6 +118,7 @@ func TestRefreshQueryFetchesAndSavesVenicePlan(t *testing.T) {
 
 func TestToolRepairSettingIsGlobal(t *testing.T) {
 	settingspkg.Set(settingspkg.Config{})
+	settingspkg.ResetStatsForTest()
 	host := &fakeHost{
 		entries: []pluginapi.HostAuthFileEntry{{
 			ID:        "venice-user",
@@ -156,6 +157,7 @@ func TestToolRepairSettingIsGlobal(t *testing.T) {
 	}
 	var payload struct {
 		Settings settingspkg.Config `json:"settings"`
+		Stats    settingspkg.Stats  `json:"stats"`
 		Accounts []accountSummary   `json:"accounts"`
 	}
 	if err := json.Unmarshal(resp.Body, &payload); err != nil {
@@ -163,6 +165,9 @@ func TestToolRepairSettingIsGlobal(t *testing.T) {
 	}
 	if !payload.Settings.ToolRepairEnabled {
 		t.Fatalf("settings = %#v", payload.Settings)
+	}
+	if payload.Stats.ToolRepairApplied != 0 || payload.Stats.ToolCallConversions != 0 {
+		t.Fatalf("stats = %#v", payload.Stats)
 	}
 	if len(payload.Accounts) != 1 {
 		t.Fatalf("accounts len = %d", len(payload.Accounts))

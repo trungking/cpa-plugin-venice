@@ -350,6 +350,7 @@ func toolInstructions(req openAIRequest) string {
 	repairMode := ""
 	if settingspkg.Get().ToolRepairEnabled {
 		repairMode = "\nPlugin tool-call repair is enabled. If your draft response is a promise to act next, convert that pending action into the matching tool call JSON instead of sending the promise as text."
+		settingspkg.MarkToolRepairApplied()
 	}
 	return strings.TrimSpace(fmt.Sprintf(`Tool calling is available.
 If a tool is needed, respond with exactly one JSON object and no markdown, no prose, no thinking text, and no surrounding text:
@@ -399,6 +400,7 @@ func aggregateOpenAIResponse(body []byte, model string, req openAIRequest) []byt
 		message["content"] = nil
 		message["tool_calls"] = toolCalls
 		finishReason = "tool_calls"
+		settingspkg.MarkToolCallConversion(len(toolCalls))
 	} else if reasoning.Len() > 0 {
 		message["reasoning_content"] = reasoning.String()
 	}
@@ -504,6 +506,7 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 								if !emitToolCallStream(emit, streamID, created, model, toolCalls) {
 									return
 								}
+								settingspkg.MarkToolCallConversion(len(toolCalls))
 								if !emit(openAIStreamUsagePayload(streamID, created, model, openAIUsage(promptTokens, completionTokens))) {
 									return
 								}
@@ -545,7 +548,11 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 
 func emitBufferedToolAwareStream(emit func(map[string]any) bool, streamID string, created int64, model string, req openAIRequest, content, reasoning string) bool {
 	if toolCalls, ok := parseToolCallsFromText(content, reasoning); ok && len(req.Tools) > 0 {
-		return emitToolCallStream(emit, streamID, created, model, toolCalls)
+		if !emitToolCallStream(emit, streamID, created, model, toolCalls) {
+			return false
+		}
+		settingspkg.MarkToolCallConversion(len(toolCalls))
+		return true
 	}
 	delta := make(map[string]any)
 	if content != "" {
