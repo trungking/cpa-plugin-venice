@@ -281,6 +281,12 @@ func aggregateOpenAIResponse(body []byte, model string, req openAIRequest) []byt
 		if event.CompletionID != "" {
 			upstreamID = event.CompletionID
 		}
+		if !event.hasAssistantText() {
+			continue
+		}
+		if event.isInitialProcessingStatus(content.Len() == 0 && reasoning.Len() == 0) {
+			continue
+		}
 		content.WriteString(event.Content)
 		reasoning.WriteString(event.ReasoningContent)
 	}
@@ -368,6 +374,12 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 					}
 					if event.CompletionID != "" {
 						streamID = event.CompletionID
+					}
+					if !event.hasAssistantText() {
+						continue
+					}
+					if event.isInitialProcessingStatus(content.Len() == 0 && reasoning.Len() == 0) {
+						continue
 					}
 					delta := make(map[string]any)
 					if event.Content != "" {
@@ -501,6 +513,20 @@ func parseVeniceLine(line string) (veniceLine, bool) {
 		return veniceLine{}, false
 	}
 	return event, true
+}
+
+func (line veniceLine) hasAssistantText() bool {
+	kind := strings.ToLower(strings.TrimSpace(line.Kind))
+	if kind != "" && kind != "content" {
+		return false
+	}
+	return line.Content != "" || line.ReasoningContent != ""
+}
+
+func (line veniceLine) isInitialProcessingStatus(noAssistantTextYet bool) bool {
+	return noAssistantTextYet &&
+		line.ReasoningContent == "" &&
+		strings.EqualFold(strings.TrimSpace(line.Content), "processing")
 }
 
 func veniceHeaders(storage authpkg.Storage, stream bool) http.Header {

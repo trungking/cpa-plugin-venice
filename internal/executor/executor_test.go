@@ -50,6 +50,8 @@ func TestOpenAIStreamChunksConvertsVeniceStream(t *testing.T) {
 	in := make(chan pluginapi.HTTPStreamChunk, 1)
 	in <- pluginapi.HTTPStreamChunk{Payload: []byte(
 		`data: {"kind":"meta","completion_id":"upstream-id"}` + "\n" +
+			`{"kind":"status","content":"processing"}` + "\n" +
+			`{"kind":"content","content":"processing"}` + "\n" +
 			`{"kind":"content","reasoning_content":"thinking"}` + "\n" +
 			`{"kind":"content","content":"hel"}` + "\n" +
 			`data: {"kind":"content","content":"lo"}` + "\n",
@@ -77,6 +79,9 @@ func TestOpenAIStreamChunksConvertsVeniceStream(t *testing.T) {
 	if !strings.Contains(joined, `"content":"hel"`) || !strings.Contains(joined, `"content":"lo"`) {
 		t.Fatalf("stream did not contain content deltas: %s", joined)
 	}
+	if strings.Contains(joined, "processing") {
+		t.Fatalf("stream leaked Venice status text: %s", joined)
+	}
 	if !strings.Contains(joined, `"usage"`) || !strings.Contains(joined, `"total_tokens"`) {
 		t.Fatalf("stream did not contain usage chunk: %s", joined)
 	}
@@ -87,6 +92,8 @@ func TestOpenAIStreamChunksConvertsVeniceStream(t *testing.T) {
 
 func TestAggregateOpenAIResponse(t *testing.T) {
 	raw := []byte(`{"kind":"meta","completion_id":"upstream-id"}` + "\n" +
+		`{"kind":"status","content":"processing"}` + "\n" +
+		`{"kind":"content","content":"processing"}` + "\n" +
 		`{"kind":"content","content":"hel","reasoning_content":"r1"}` + "\n" +
 		`{"kind":"content","content":"lo","reasoning_content":"r2"}` + "\n")
 	req := openAIRequest{Model: "zai-org-glm-5.2", Messages: []openAIMessage{{Role: "user", Content: "hello"}}}
@@ -102,6 +109,9 @@ func TestAggregateOpenAIResponse(t *testing.T) {
 	message := choice["message"].(map[string]any)
 	if message["content"] != "hello" {
 		t.Fatalf("content = %#v", message["content"])
+	}
+	if strings.Contains(message["content"].(string), "processing") {
+		t.Fatalf("content leaked status text: %#v", message["content"])
 	}
 	if message["reasoning_content"] != "r1r2" {
 		t.Fatalf("reasoning = %#v", message["reasoning_content"])
