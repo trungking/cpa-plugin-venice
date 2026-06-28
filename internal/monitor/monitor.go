@@ -25,6 +25,8 @@ type Usage struct {
 
 type RequestInfo struct {
 	Source      string
+	ClientKey   string
+	ClientHash  string
 	Model       string
 	Effort      string
 	Tier        string
@@ -39,25 +41,29 @@ type Result struct {
 }
 
 type Record struct {
-	ID        string    `json:"id"`
-	Source    string    `json:"source"`
-	Provider  string    `json:"provider"`
-	Model     string    `json:"model"`
-	Effort    string    `json:"effort"`
-	Tier      string    `json:"tier"`
-	Status    string    `json:"status"`
-	Success   bool      `json:"success"`
-	Error     string    `json:"error,omitempty"`
-	StartedAt time.Time `json:"started_at"`
-	EndedAt   time.Time `json:"ended_at"`
-	ElapsedMS int64     `json:"elapsed_ms"`
-	TTFTMS    int64     `json:"ttft_ms"`
-	Usage     Usage     `json:"usage"`
+	ID         string    `json:"id"`
+	Source     string    `json:"source"`
+	ClientKey  string    `json:"client_key,omitempty"`
+	ClientHash string    `json:"client_key_hash,omitempty"`
+	Provider   string    `json:"provider"`
+	Model      string    `json:"model"`
+	Effort     string    `json:"effort"`
+	Tier       string    `json:"tier"`
+	Status     string    `json:"status"`
+	Success    bool      `json:"success"`
+	Error      string    `json:"error,omitempty"`
+	StartedAt  time.Time `json:"started_at"`
+	EndedAt    time.Time `json:"ended_at"`
+	ElapsedMS  int64     `json:"elapsed_ms"`
+	TTFTMS     int64     `json:"ttft_ms"`
+	Usage      Usage     `json:"usage"`
 }
 
 type Row struct {
 	ID          string   `json:"id"`
 	Source      string   `json:"source"`
+	ClientKey   string   `json:"client_key,omitempty"`
+	ClientHash  string   `json:"client_key_hash,omitempty"`
 	Provider    string   `json:"provider"`
 	Model       string   `json:"model"`
 	Effort      string   `json:"effort"`
@@ -88,6 +94,10 @@ type Summary struct {
 	Rows     int `json:"rows"`
 	Failures int `json:"failures"`
 	Accounts int `json:"accounts"`
+	Total    int `json:"total"`
+	Page     int `json:"page"`
+	PageSize int `json:"page_size"`
+	Pages    int `json:"pages"`
 }
 
 type Span struct {
@@ -118,7 +128,7 @@ func Start(info RequestInfo) *Span {
 	n := atomic.AddUint64(&seq, 1)
 	return &Span{
 		id:      fmt.Sprintf("venice-%d-%d", time.Now().UnixNano(), n),
-		info:    RequestInfo{Source: source, Model: model, Effort: effort, Tier: tier, InputTokens: info.InputTokens},
+		info:    RequestInfo{Source: source, ClientKey: strings.TrimSpace(info.ClientKey), ClientHash: strings.TrimSpace(info.ClientHash), Model: model, Effort: effort, Tier: tier, InputTokens: info.InputTokens},
 		started: time.Now(),
 	}
 }
@@ -152,19 +162,21 @@ func (s *Span) Finish(result Result) {
 		total = s.info.InputTokens + result.OutputTokens
 	}
 	record := Record{
-		ID:        s.id,
-		Source:    s.info.Source,
-		Provider:  "venice",
-		Model:     s.info.Model,
-		Effort:    s.info.Effort,
-		Tier:      s.info.Tier,
-		Status:    statusText(result.Success),
-		Success:   result.Success,
-		Error:     strings.TrimSpace(result.Error),
-		StartedAt: s.started,
-		EndedAt:   ended,
-		ElapsedMS: elapsed,
-		TTFTMS:    ttft,
+		ID:         s.id,
+		Source:     s.info.Source,
+		ClientKey:  s.info.ClientKey,
+		ClientHash: s.info.ClientHash,
+		Provider:   "venice",
+		Model:      s.info.Model,
+		Effort:     s.info.Effort,
+		Tier:       s.info.Tier,
+		Status:     statusText(result.Success),
+		Success:    result.Success,
+		Error:      strings.TrimSpace(result.Error),
+		StartedAt:  s.started,
+		EndedAt:    ended,
+		ElapsedMS:  elapsed,
+		TTFTMS:     ttft,
 		Usage: Usage{
 			InputTokens:  s.info.InputTokens,
 			OutputTokens: result.OutputTokens,
@@ -180,28 +192,56 @@ func (s *Span) Finish(result Result) {
 }
 
 func SnapshotRows(limit int, failuresOnly bool, masked bool) Snapshot {
+	return SnapshotPage(limit, 1, failuresOnly, masked)
+}
+
+func SnapshotPage(pageSize int, page int, failuresOnly bool, masked bool) Snapshot {
 	state.Lock()
 	records := append([]Record(nil), state.records...)
 	state.Unlock()
-	if limit <= 0 || limit > maxRecords {
-		limit = maxRecords
+	if pageSize <= 0 || pageSize > maxRecords {
+		pageSize = maxRecords
 	}
-	if len(records) > limit {
-		records = records[len(records)-limit:]
+	if page <= 0 {
+		page = 1
+	}
+	filtered := make([]Record, 0, len(records))
+	for _, record := range records {
+		if record.Success && failuresOnly {
+			continue
+		}
+		filtered = append(filtered, record)
+	}
+	total := len(filtered)
+	pages := 0
+	if total > 0 {
+		pages = (total + pageSize - 1) / pageSize
+	}
+	if pages > 0 && page > pages {
+		page = pages
+	}
+	start := total - page*pageSize
+	if start < 0 {
+		start = 0
+	}
+	end := total - (page-1)*pageSize
+	if end < start {
+		end = start
 	}
 	sourceSet := map[string]bool{}
 	failures := 0
-	rows := make([]Row, 0, len(records))
-	for i := len(records) - 1; i >= 0; i-- {
-		record := records[i]
-		if record.Success {
-			if failuresOnly {
-				continue
-			}
-		} else {
+	for _, record := range filtered {
+		if !record.Success {
 			failures++
 		}
 		sourceSet[record.Source] = true
+	}
+	rows := make([]Row, 0, end-start)
+	for i := end - 1; i >= start; i-- {
+		if i < 0 || i >= len(filtered) {
+			continue
+		}
+		record := filtered[i]
 		rows = append(rows, rowFromRecord(record, masked))
 	}
 	return Snapshot{
@@ -210,6 +250,10 @@ func SnapshotRows(limit int, failuresOnly bool, masked bool) Snapshot {
 			Rows:     len(rows),
 			Failures: failures,
 			Accounts: len(sourceSet),
+			Total:    total,
+			Page:     page,
+			PageSize: pageSize,
+			Pages:    pages,
 		},
 		Rows: rows,
 	}
@@ -239,10 +283,14 @@ func rowFromRecord(record Record, masked bool) Row {
 	detail := record
 	if masked {
 		detail.Source = maskSource(detail.Source)
+		detail.ClientKey = maskKey(detail.ClientKey)
+		detail.ClientHash = maskKey(detail.ClientHash)
 	}
 	return Row{
 		ID:          record.ID,
 		Source:      chooseSource(record.Source, masked),
+		ClientKey:   chooseKey(record.ClientKey, masked),
+		ClientHash:  chooseHash(record.ClientHash, masked),
 		Provider:    "venice",
 		Model:       record.Model,
 		Effort:      record.Effort,
@@ -269,6 +317,42 @@ func chooseSource(source string, masked bool) string {
 		return maskSource(source)
 	}
 	return source
+}
+
+func chooseKey(key string, masked bool) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "unknown"
+	}
+	if masked {
+		return maskKey(key)
+	}
+	return key
+}
+
+func chooseHash(hash string, masked bool) string {
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		return ""
+	}
+	return hash
+}
+
+func maskKey(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "unknown"
+	}
+	if strings.Contains(key, "@") {
+		return maskSource(key)
+	}
+	if strings.HasPrefix(strings.ToLower(key), "bearer ") {
+		key = strings.TrimSpace(key[7:])
+	}
+	if len(key) <= 8 {
+		return "***"
+	}
+	return key[:4] + "***" + key[len(key)-4:]
 }
 
 func maskSource(source string) string {

@@ -46,6 +46,45 @@ func TestBuildVeniceRequestFromOpenAIChat(t *testing.T) {
 	}
 }
 
+func TestBuildVeniceRequestAddsToolInstructions(t *testing.T) {
+	req := pluginapi.ExecutorRequest{
+		Model: "zai-org-glm-5-2",
+		Payload: []byte(`{
+			"model":"zai-org-glm-5-2",
+			"messages":[
+				{"role":"system","content":"You are an agent."},
+				{"role":"user","content":"Inspect files"}
+			],
+			"tools":[{
+				"type":"function",
+				"function":{
+					"name":"list_files",
+					"description":"List files",
+					"parameters":{"type":"object","properties":{"path":{"type":"string"}}}
+				}
+			}],
+			"tool_choice":"auto"
+		}`),
+	}
+	_, raw, _, err := buildVeniceRequest(req)
+	if err != nil {
+		t.Fatalf("buildVeniceRequest error: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	systemPrompt := body["systemPrompt"].(string)
+	if !strings.Contains(systemPrompt, "Tool calling is available") || !strings.Contains(systemPrompt, "list_files") {
+		t.Fatalf("systemPrompt missing tool instructions: %s", systemPrompt)
+	}
+	prompt := body["prompt"].([]any)
+	last := prompt[len(prompt)-1].(map[string]any)
+	if strings.HasPrefix(last["content"].(string), "/think ") {
+		t.Fatalf("tool-enabled request should not force /think: %#v", last["content"])
+	}
+}
+
 func TestOpenAIStreamChunksConvertsVeniceStream(t *testing.T) {
 	in := make(chan pluginapi.HTTPStreamChunk, 1)
 	in <- pluginapi.HTTPStreamChunk{Payload: []byte(
@@ -90,6 +129,39 @@ func TestOpenAIStreamChunksConvertsVeniceStream(t *testing.T) {
 	}
 }
 
+func TestOpenAIStreamChunksConvertsToolCall(t *testing.T) {
+	in := make(chan pluginapi.HTTPStreamChunk, 1)
+	in <- pluginapi.HTTPStreamChunk{Payload: []byte(
+		`data: {"kind":"content","content":"{\"tool_calls\":[{\"name\":\"list_files\",\"arguments\":{\"path\":\".\"}}]}"}` + "\n",
+	)}
+	close(in)
+
+	var frames []string
+	req := openAIRequest{
+		Model:    "zai-org-glm-5.2",
+		Messages: []openAIMessage{{Role: "user", Content: "inspect"}},
+		Tools: []json.RawMessage{
+			json.RawMessage(`{"type":"function","function":{"name":"list_files"}}`),
+		},
+	}
+	for chunk := range openAIStreamChunks(context.Background(), in, "zai-org-glm-5.2", req) {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+		frames = append(frames, string(chunk.Payload))
+	}
+	joined := strings.Join(frames, "")
+	if !strings.Contains(joined, `"tool_calls"`) || !strings.Contains(joined, `"name":"list_files"`) {
+		t.Fatalf("stream did not contain tool call delta: %s", joined)
+	}
+	if !strings.Contains(joined, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("stream did not finish with tool_calls: %s", joined)
+	}
+	if strings.Contains(joined, `"content":"{\\"tool_calls\\"`) {
+		t.Fatalf("stream leaked tool JSON as content: %s", joined)
+	}
+}
+
 func TestAggregateOpenAIResponse(t *testing.T) {
 	raw := []byte(`{"kind":"meta","completion_id":"upstream-id"}` + "\n" +
 		`{"kind":"status","content":"processing"}` + "\n" +
@@ -119,5 +191,53 @@ func TestAggregateOpenAIResponse(t *testing.T) {
 	usage := body["usage"].(map[string]any)
 	if usage["total_tokens"].(float64) <= 0 {
 		t.Fatalf("usage = %#v, want estimated tokens", usage)
+	}
+}
+
+func TestAggregateOpenAIResponseWithToolCall(t *testing.T) {
+	raw := []byte(`{"kind":"content","content":"{\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{\"path\":\"README.md\"}}]}"}` + "\n")
+	req := openAIRequest{
+		Model:    "zai-org-glm-5.2",
+		Messages: []openAIMessage{{Role: "user", Content: "read readme"}},
+		Tools: []json.RawMessage{
+			json.RawMessage(`{"type":"function","function":{"name":"read_file"}}`),
+		},
+	}
+	out := aggregateOpenAIResponse(raw, "zai-org-glm-5.2", req)
+	var body map[string]any
+	if err := json.Unmarshal(out, &body); err != nil {
+		t.Fatalf("decode output: %v", err)
+	}
+	choice := body["choices"].([]any)[0].(map[string]any)
+	if choice["finish_reason"] != "tool_calls" {
+		t.Fatalf("finish_reason = %#v", choice["finish_reason"])
+	}
+	message := choice["message"].(map[string]any)
+	calls := message["tool_calls"].([]any)
+	call := calls[0].(map[string]any)
+	fn := call["function"].(map[string]any)
+	if fn["name"] != "read_file" || !strings.Contains(fn["arguments"].(string), "README.md") {
+		t.Fatalf("tool call = %#v", call)
+	}
+	if message["content"] != nil {
+		t.Fatalf("content = %#v, want nil for tool call", message["content"])
+	}
+}
+
+func TestClientKeyLabelPrefersAlias(t *testing.T) {
+	req := pluginapi.ExecutorRequest{
+		Metadata: map[string]any{
+			"api_key_id": "raw-key-id",
+			"alias":      "team-build",
+		},
+		Headers: map[string][]string{
+			"Authorization": {"Bearer secret-token"},
+		},
+	}
+	if got := clientKeyLabel(req); got != "team-build" {
+		t.Fatalf("clientKeyLabel = %q", got)
+	}
+	if got := clientKeyHash(req); got != sha256Hex("secret-token") {
+		t.Fatalf("clientKeyHash = %q", got)
 	}
 }

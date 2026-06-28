@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -22,18 +24,35 @@ const chatURL = "https://outerface.venice.ai/api/inference/chat"
 type Executor struct{}
 
 type openAIRequest struct {
-	Model           string          `json:"model"`
-	Messages        []openAIMessage `json:"messages"`
-	Stream          bool            `json:"stream"`
-	Temperature     any             `json:"temperature,omitempty"`
-	TopP            any             `json:"top_p,omitempty"`
-	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
-	ServiceTier     string          `json:"service_tier,omitempty"`
+	Model             string            `json:"model"`
+	Messages          []openAIMessage   `json:"messages"`
+	Stream            bool              `json:"stream"`
+	Temperature       any               `json:"temperature,omitempty"`
+	TopP              any               `json:"top_p,omitempty"`
+	ReasoningEffort   string            `json:"reasoning_effort,omitempty"`
+	ServiceTier       string            `json:"service_tier,omitempty"`
+	Tools             []json.RawMessage `json:"tools,omitempty"`
+	ToolChoice        any               `json:"tool_choice,omitempty"`
+	ParallelToolCalls *bool             `json:"parallel_tool_calls,omitempty"`
 }
 
 type openAIMessage struct {
-	Role    string `json:"role"`
-	Content any    `json:"content"`
+	Role       string           `json:"role"`
+	Content    any              `json:"content"`
+	Name       string           `json:"name,omitempty"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
+	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
+}
+
+type openAIToolCall struct {
+	ID       string             `json:"id"`
+	Type     string             `json:"type"`
+	Function openAIFunctionCall `json:"function"`
+}
+
+type openAIFunctionCall struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 type veniceLine struct {
@@ -58,6 +77,8 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 	}
 	span := monitor.Start(monitor.RequestInfo{
 		Source:      firstNonEmpty(storage.Email, storage.UserID, req.AuthID),
+		ClientKey:   clientKeyLabel(req),
+		ClientHash:  clientKeyHash(req),
 		Model:       model,
 		Effort:      firstNonEmpty(metadataString(req.Metadata, "reasoning_effort"), openReq.ReasoningEffort),
 		Tier:        firstNonEmpty(metadataString(req.Metadata, "service_tier"), openReq.ServiceTier),
@@ -98,6 +119,8 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 	}
 	span := monitor.Start(monitor.RequestInfo{
 		Source:      firstNonEmpty(storage.Email, storage.UserID, req.AuthID),
+		ClientKey:   clientKeyLabel(req),
+		ClientHash:  clientKeyHash(req),
 		Model:       model,
 		Effort:      firstNonEmpty(metadataString(req.Metadata, "reasoning_effort"), openReq.ReasoningEffort),
 		Tier:        firstNonEmpty(metadataString(req.Metadata, "service_tier"), openReq.ServiceTier),
@@ -186,7 +209,7 @@ func buildVeniceRequest(req pluginapi.ExecutorRequest) (openAIRequest, []byte, s
 	}
 	model := firstNonEmpty(req.Model, openReq.Model, "zai-org-glm-5.2")
 	veniceModel := toVeniceWebModelID(model)
-	systemPrompt, prompt := splitMessages(openReq.Messages)
+	systemPrompt, prompt := splitMessages(openReq)
 	temperature := openReq.Temperature
 	if temperature == nil {
 		temperature = 0.6
@@ -218,24 +241,42 @@ func buildVeniceRequest(req pluginapi.ExecutorRequest) (openAIRequest, []byte, s
 	return openReq, raw, veniceModel, errMarshal
 }
 
-func splitMessages(messages []openAIMessage) (string, []map[string]string) {
+func splitMessages(req openAIRequest) (string, []map[string]string) {
 	systemParts := make([]string, 0)
-	prompt := make([]map[string]string, 0, len(messages))
-	for _, message := range messages {
+	prompt := make([]map[string]string, 0, len(req.Messages))
+	for _, message := range req.Messages {
 		content := normalizeContent(message.Content)
+		if message.Role == "system" {
+			if content != "" {
+				systemParts = append(systemParts, content)
+			}
+			continue
+		}
+		if message.Role == "tool" {
+			content = formatToolResultMessage(message)
+		}
+		if len(message.ToolCalls) > 0 {
+			content = strings.TrimSpace(content + "\n\n" + formatAssistantToolCalls(message.ToolCalls))
+		}
 		if content == "" {
 			continue
 		}
-		if message.Role == "system" {
-			systemParts = append(systemParts, content)
-			continue
+		role := message.Role
+		if role == "tool" {
+			role = "user"
 		}
-		prompt = append(prompt, map[string]string{"role": message.Role, "content": content})
+		prompt = append(prompt, map[string]string{"role": role, "content": content})
 	}
-	return strings.Join(systemParts, "\n\n"), maybePrefixReasoning(prompt)
+	if instructions := toolInstructions(req); instructions != "" {
+		systemParts = append(systemParts, instructions)
+	}
+	return strings.Join(systemParts, "\n\n"), maybePrefixReasoning(prompt, len(req.Tools) == 0)
 }
 
-func maybePrefixReasoning(prompt []map[string]string) []map[string]string {
+func maybePrefixReasoning(prompt []map[string]string, enabled bool) []map[string]string {
+	if !enabled {
+		return prompt
+	}
 	for i := len(prompt) - 1; i >= 0; i-- {
 		if prompt[i]["role"] == "user" && !strings.HasPrefix(prompt[i]["content"], "/think ") {
 			prompt[i]["content"] = "/think " + prompt[i]["content"]
@@ -247,6 +288,8 @@ func maybePrefixReasoning(prompt []map[string]string) []map[string]string {
 
 func normalizeContent(value any) string {
 	switch v := value.(type) {
+	case nil:
+		return ""
 	case string:
 		return v
 	case []any:
@@ -262,6 +305,43 @@ func normalizeContent(value any) string {
 	default:
 		return fmt.Sprint(v)
 	}
+}
+
+func formatToolResultMessage(message openAIMessage) string {
+	content := normalizeContent(message.Content)
+	name := strings.TrimSpace(message.Name)
+	if name != "" {
+		name = " (" + name + ")"
+	}
+	id := strings.TrimSpace(message.ToolCallID)
+	if id == "" {
+		id = "unknown"
+	}
+	return fmt.Sprintf("Tool result for %s%s:\n%s", id, name, content)
+}
+
+func formatAssistantToolCalls(calls []openAIToolCall) string {
+	raw, _ := json.Marshal(calls)
+	return "Assistant requested these tool calls:\n" + string(raw)
+}
+
+func toolInstructions(req openAIRequest) string {
+	if len(req.Tools) == 0 {
+		return ""
+	}
+	toolsRaw, _ := json.Marshal(req.Tools)
+	choiceRaw, _ := json.Marshal(req.ToolChoice)
+	return strings.TrimSpace(fmt.Sprintf(`Tool calling is available.
+When you need a tool, respond with exactly one JSON object and no markdown, no prose, and no surrounding text:
+{"tool_calls":[{"name":"tool_name","arguments":{}}]}
+The "name" must exactly match one available tool name. The "arguments" value must be a JSON object matching that tool schema.
+After tool results are provided in later messages, answer normally or request another tool with the same JSON format.
+
+Available tools:
+%s
+
+tool_choice:
+%s`, string(toolsRaw), string(choiceRaw)))
 }
 
 func aggregateOpenAIResponse(body []byte, model string, req openAIRequest) []byte {
@@ -291,6 +371,12 @@ func aggregateOpenAIResponse(body []byte, model string, req openAIRequest) []byt
 		reasoning.WriteString(event.ReasoningContent)
 	}
 	message := map[string]any{"role": "assistant", "content": content.String()}
+	finishReason := "stop"
+	if toolCalls, ok := parseToolCalls(content.String()); ok && len(req.Tools) > 0 {
+		message["content"] = nil
+		message["tool_calls"] = toolCalls
+		finishReason = "tool_calls"
+	}
 	if reasoning.Len() > 0 {
 		message["reasoning_content"] = reasoning.String()
 	}
@@ -304,7 +390,7 @@ func aggregateOpenAIResponse(body []byte, model string, req openAIRequest) []byt
 		"choices": []map[string]any{{
 			"index":         0,
 			"message":       message,
-			"finish_reason": "stop",
+			"finish_reason": finishReason,
 		}},
 		"usage": openAIUsage(promptTokens, completionTokens),
 	}
@@ -346,11 +432,14 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 				return
 			case chunk, ok := <-in:
 				if !ok {
-					if !emit(openAIStreamPayload(streamID, created, model, map[string]any{}, "stop")) {
-						return
-					}
 					promptTokens := estimateRequestTokens(req)
 					completionTokens := estimateTokens(content.String()) + estimateTokens(reasoning.String())
+					if len(req.Tools) > 0 && !emitBufferedToolAwareStream(emit, streamID, created, model, req, content.String(), reasoning.String()) {
+						return
+					}
+					if len(req.Tools) == 0 && !emit(openAIStreamPayload(streamID, created, model, map[string]any{}, "stop")) {
+						return
+					}
 					if !emit(openAIStreamUsagePayload(streamID, created, model, openAIUsage(promptTokens, completionTokens))) {
 						return
 					}
@@ -380,6 +469,16 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 					if event.isInitialProcessingStatus(content.Len() == 0 && reasoning.Len() == 0) {
 						continue
 					}
+					if len(req.Tools) > 0 {
+						if event.Content != "" || event.ReasoningContent != "" {
+							if span != nil {
+								span.MarkTTFT()
+							}
+							content.WriteString(event.Content)
+							reasoning.WriteString(event.ReasoningContent)
+						}
+						continue
+					}
 					delta := make(map[string]any)
 					if event.Content != "" {
 						if span != nil {
@@ -406,6 +505,41 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 		}
 	}()
 	return out
+}
+
+func emitBufferedToolAwareStream(emit func(map[string]any) bool, streamID string, created int64, model string, req openAIRequest, content, reasoning string) bool {
+	if toolCalls, ok := parseToolCalls(content); ok && len(req.Tools) > 0 {
+		for i, call := range toolCalls {
+			delta := map[string]any{
+				"tool_calls": []map[string]any{{
+					"index": i,
+					"id":    call.ID,
+					"type":  firstNonEmpty(call.Type, "function"),
+					"function": map[string]any{
+						"name":      call.Function.Name,
+						"arguments": call.Function.Arguments,
+					},
+				}},
+			}
+			if !emit(openAIStreamPayload(streamID, created, model, delta, nil)) {
+				return false
+			}
+		}
+		return emit(openAIStreamPayload(streamID, created, model, map[string]any{}, "tool_calls"))
+	}
+	delta := make(map[string]any)
+	if content != "" {
+		delta["content"] = content
+	}
+	if reasoning != "" {
+		delta["reasoning_content"] = reasoning
+	}
+	if len(delta) > 0 {
+		if !emit(openAIStreamPayload(streamID, created, model, delta, nil)) {
+			return false
+		}
+	}
+	return emit(openAIStreamPayload(streamID, created, model, map[string]any{}, "stop"))
 }
 
 func usageFromOpenAIResponse(payload []byte) monitor.Usage {
@@ -444,6 +578,111 @@ func metadataString(metadata map[string]any, key string) string {
 	}
 }
 
+func clientKeyLabel(req pluginapi.ExecutorRequest) string {
+	for _, key := range []string{
+		"alias", "key_alias", "keyAlias", "api_key_alias", "apiKeyAlias",
+		"api-key-alias", "key-alias", "cpamp_key_alias", "cpampKeyAlias",
+		"api_key_name", "apiKeyName", "key_name", "keyName",
+		"api_key_label", "apiKeyLabel", "key_label", "keyLabel",
+		"api_key_id", "apiKeyID", "key_id", "keyID",
+		"client_key", "clientKey", "consumer", "consumer_name", "user",
+	} {
+		if value := metadataString(req.Metadata, key); value != "" {
+			return value
+		}
+	}
+	for _, key := range []string{
+		"alias", "key_alias", "keyAlias", "api_key_alias", "apiKeyAlias",
+		"api-key-alias", "key-alias", "cpamp_key_alias", "cpampKeyAlias",
+		"api_key_name", "apiKeyName", "key_name", "keyName",
+		"api_key_label", "apiKeyLabel", "key_label", "keyLabel",
+		"api_key_id", "apiKeyID", "key_id", "keyID",
+		"client_key", "clientKey", "consumer", "consumer_name", "user",
+	} {
+		if value := metadataString(req.AuthMetadata, key); value != "" {
+			return value
+		}
+	}
+	for _, key := range []string{"alias", "key_alias", "keyAlias", "api_key_alias", "apiKeyAlias", "api-key-alias", "key-alias", "api_key_name", "apiKeyName", "key_name", "keyName", "api_key_id", "key_id", "name"} {
+		if value := strings.TrimSpace(req.AuthAttributes[key]); value != "" {
+			return value
+		}
+	}
+	for _, header := range []string{"X-API-Key-Alias", "X-Api-Key-Alias", "X-Key-Alias", "X-CPAMP-Key-Alias", "X-API-Key-Name", "X-Api-Key-Name", "X-API-Key-ID", "X-Api-Key-Id", "X-Consumer-Name", "X-Request-Key"} {
+		if value := strings.TrimSpace(req.Headers.Get(header)); value != "" {
+			return value
+		}
+	}
+	if auth := strings.TrimSpace(req.Headers.Get("Authorization")); auth != "" {
+		return auth
+	}
+	if key := strings.TrimSpace(req.Headers.Get("X-API-Key")); key != "" {
+		return key
+	}
+	return ""
+}
+
+func clientKeyHash(req pluginapi.ExecutorRequest) string {
+	for _, key := range []string{
+		"apiKeyHash", "api_key_hash", "api-key-hash", "keyHash", "key_hash", "key-hash",
+		"clientKeyHash", "client_key_hash", "cpampApiKeyHash", "cpamp_api_key_hash",
+	} {
+		if value := metadataString(req.Metadata, key); isSHA256Hex(value) {
+			return strings.ToLower(value)
+		}
+	}
+	for _, key := range []string{
+		"apiKeyHash", "api_key_hash", "api-key-hash", "keyHash", "key_hash", "key-hash",
+		"clientKeyHash", "client_key_hash", "cpampApiKeyHash", "cpamp_api_key_hash",
+	} {
+		if value := metadataString(req.AuthMetadata, key); isSHA256Hex(value) {
+			return strings.ToLower(value)
+		}
+	}
+	for _, key := range []string{"apiKeyHash", "api_key_hash", "api-key-hash", "keyHash", "key_hash", "key-hash"} {
+		if value := strings.TrimSpace(req.AuthAttributes[key]); isSHA256Hex(value) {
+			return strings.ToLower(value)
+		}
+	}
+	for _, header := range []string{"X-API-Key-Hash", "X-Api-Key-Hash", "X-Key-Hash", "X-CPAMP-Key-Hash"} {
+		if value := strings.TrimSpace(req.Headers.Get(header)); isSHA256Hex(value) {
+			return strings.ToLower(value)
+		}
+	}
+	if key := bearerToken(req.Headers.Get("Authorization")); key != "" {
+		return sha256Hex(key)
+	}
+	if key := strings.TrimSpace(req.Headers.Get("X-API-Key")); key != "" {
+		return sha256Hex(key)
+	}
+	return ""
+}
+
+func bearerToken(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if strings.HasPrefix(strings.ToLower(value), "bearer ") {
+		return strings.TrimSpace(value[7:])
+	}
+	return ""
+}
+
+func sha256Hex(value string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(value)))
+	return hex.EncodeToString(sum[:])
+}
+
+func isSHA256Hex(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
 func openAIStreamUsagePayload(id string, created int64, model string, usage map[string]int) map[string]any {
 	return map[string]any{
 		"id":      id,
@@ -467,6 +706,191 @@ func openAIStreamPayload(id string, created int64, model string, delta map[strin
 			"finish_reason": finishReason,
 		}},
 	}
+}
+
+func parseToolCalls(text string) ([]openAIToolCall, bool) {
+	for _, candidate := range toolJSONCandidates(text) {
+		if calls, ok := parseToolCallsJSON(candidate); ok {
+			return calls, true
+		}
+	}
+	return nil, false
+}
+
+func toolJSONCandidates(text string) []string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	out := []string{text}
+	if fenced := extractFencedJSON(text); fenced != "" {
+		out = append(out, fenced)
+	}
+	if obj := extractBalancedJSON(text, '{', '}'); obj != "" && obj != text {
+		out = append(out, obj)
+	}
+	if arr := extractBalancedJSON(text, '[', ']'); arr != "" && arr != text {
+		out = append(out, arr)
+	}
+	return out
+}
+
+func extractFencedJSON(text string) string {
+	start := strings.Index(text, "```")
+	if start < 0 {
+		return ""
+	}
+	rest := text[start+3:]
+	if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+		rest = rest[nl+1:]
+	}
+	end := strings.Index(rest, "```")
+	if end < 0 {
+		return ""
+	}
+	return strings.TrimSpace(rest[:end])
+}
+
+func extractBalancedJSON(text string, open, close rune) string {
+	start := strings.IndexRune(text, open)
+	if start < 0 {
+		return ""
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	for i, r := range text[start:] {
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			switch r {
+			case '\\':
+				escaped = true
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		switch r {
+		case '"':
+			inString = true
+		case open:
+			depth++
+		case close:
+			depth--
+			if depth == 0 {
+				return strings.TrimSpace(text[start : start+i+1])
+			}
+		}
+	}
+	return ""
+}
+
+func parseToolCallsJSON(raw string) ([]openAIToolCall, bool) {
+	var value any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &value); err != nil {
+		return nil, false
+	}
+	items := toolCallItems(value)
+	if len(items) == 0 {
+		return nil, false
+	}
+	calls := make([]openAIToolCall, 0, len(items))
+	for i, item := range items {
+		call, ok := normalizeToolCall(item, i)
+		if !ok {
+			return nil, false
+		}
+		calls = append(calls, call)
+	}
+	return calls, true
+}
+
+func toolCallItems(value any) []any {
+	switch typed := value.(type) {
+	case []any:
+		return typed
+	case map[string]any:
+		if raw, ok := typed["tool_calls"].([]any); ok {
+			return raw
+		}
+		if raw, ok := typed["toolCalls"].([]any); ok {
+			return raw
+		}
+		if _, hasName := typed["name"]; hasName {
+			return []any{typed}
+		}
+		if _, hasFunction := typed["function"]; hasFunction {
+			return []any{typed}
+		}
+	}
+	return nil
+}
+
+func normalizeToolCall(value any, _ int) (openAIToolCall, bool) {
+	item, ok := value.(map[string]any)
+	if !ok {
+		return openAIToolCall{}, false
+	}
+	id := firstNonEmpty(stringFromAny(item["id"]), "call_"+randomID())
+	callType := firstNonEmpty(stringFromAny(item["type"]), "function")
+	name := firstNonEmpty(stringFromAny(item["name"]), stringFromAny(item["tool"]))
+	args := item["arguments"]
+	if args == nil {
+		args = item["args"]
+	}
+	if fn, ok := item["function"].(map[string]any); ok {
+		name = firstNonEmpty(stringFromAny(fn["name"]), name)
+		if fn["arguments"] != nil {
+			args = fn["arguments"]
+		}
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return openAIToolCall{}, false
+	}
+	return openAIToolCall{
+		ID:   id,
+		Type: callType,
+		Function: openAIFunctionCall{
+			Name:      name,
+			Arguments: argumentsString(args),
+		},
+	}, true
+}
+
+func stringFromAny(value any) string {
+	if value == nil {
+		return ""
+	}
+	if typed, ok := value.(string); ok {
+		return strings.TrimSpace(typed)
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
+}
+
+func argumentsString(value any) string {
+	if value == nil {
+		return "{}"
+	}
+	if text, ok := value.(string); ok {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return "{}"
+		}
+		if json.Valid([]byte(text)) {
+			return text
+		}
+		raw, _ := json.Marshal(map[string]string{"value": text})
+		return string(raw)
+	}
+	raw, err := json.Marshal(value)
+	if err != nil || len(raw) == 0 || string(raw) == "null" {
+		return "{}"
+	}
+	return string(raw)
 }
 
 func openAIUsage(promptTokens, completionTokens int) map[string]int {
