@@ -14,6 +14,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	authpkg "github.com/trungking/cpa-plugin-venice/internal/auth"
+	"github.com/trungking/cpa-plugin-venice/internal/monitor"
 )
 
 const chatURL = "https://outerface.venice.ai/api/inference/chat"
@@ -21,11 +22,13 @@ const chatURL = "https://outerface.venice.ai/api/inference/chat"
 type Executor struct{}
 
 type openAIRequest struct {
-	Model       string          `json:"model"`
-	Messages    []openAIMessage `json:"messages"`
-	Stream      bool            `json:"stream"`
-	Temperature any             `json:"temperature,omitempty"`
-	TopP        any             `json:"top_p,omitempty"`
+	Model           string          `json:"model"`
+	Messages        []openAIMessage `json:"messages"`
+	Stream          bool            `json:"stream"`
+	Temperature     any             `json:"temperature,omitempty"`
+	TopP            any             `json:"top_p,omitempty"`
+	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
+	ServiceTier     string          `json:"service_tier,omitempty"`
 }
 
 type openAIMessage struct {
@@ -53,6 +56,13 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 	if errBuild != nil {
 		return pluginapi.ExecutorResponse{}, errBuild
 	}
+	span := monitor.Start(monitor.RequestInfo{
+		Source:      firstNonEmpty(storage.Email, storage.UserID, req.AuthID),
+		Model:       model,
+		Effort:      firstNonEmpty(metadataString(req.Metadata, "reasoning_effort"), openReq.ReasoningEffort),
+		Tier:        firstNonEmpty(metadataString(req.Metadata, "service_tier"), openReq.ServiceTier),
+		InputTokens: int64(estimateRequestTokens(openReq)),
+	})
 	resp, errDo := requireClient(req.HTTPClient).Do(ctx, pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     chatURL,
@@ -60,12 +70,17 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 		Body:    veniceBody,
 	})
 	if errDo != nil {
+		span.Finish(monitor.Result{Success: false, Error: errDo.Error()})
 		return pluginapi.ExecutorResponse{}, errDo
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return pluginapi.ExecutorResponse{}, fmt.Errorf("venice chat failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(resp.Body)))
+		errStatus := fmt.Errorf("venice chat failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(resp.Body)))
+		span.Finish(monitor.Result{Success: false, Error: errStatus.Error()})
+		return pluginapi.ExecutorResponse{}, errStatus
 	}
 	payload := aggregateOpenAIResponse(resp.Body, model, openReq)
+	usage := usageFromOpenAIResponse(payload)
+	span.Finish(monitor.Result{Success: true, OutputTokens: usage.OutputTokens, TotalTokens: usage.TotalTokens})
 	return pluginapi.ExecutorResponse{
 		Payload: payload,
 		Headers: http.Header{"Content-Type": []string{"application/json"}},
@@ -81,6 +96,13 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 	if errBuild != nil {
 		return pluginapi.ExecutorStreamResponse{}, errBuild
 	}
+	span := monitor.Start(monitor.RequestInfo{
+		Source:      firstNonEmpty(storage.Email, storage.UserID, req.AuthID),
+		Model:       model,
+		Effort:      firstNonEmpty(metadataString(req.Metadata, "reasoning_effort"), openReq.ReasoningEffort),
+		Tier:        firstNonEmpty(metadataString(req.Metadata, "service_tier"), openReq.ServiceTier),
+		InputTokens: int64(estimateRequestTokens(openReq)),
+	})
 	resp, errDo := requireClient(req.HTTPClient).DoStream(ctx, pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     chatURL,
@@ -88,14 +110,17 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 		Body:    veniceBody,
 	})
 	if errDo != nil {
+		span.Finish(monitor.Result{Success: false, Error: errDo.Error()})
 		return pluginapi.ExecutorStreamResponse{}, errDo
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return pluginapi.ExecutorStreamResponse{}, fmt.Errorf("venice chat stream failed: status %d", resp.StatusCode)
+		errStatus := fmt.Errorf("venice chat stream failed: status %d", resp.StatusCode)
+		span.Finish(monitor.Result{Success: false, Error: errStatus.Error()})
+		return pluginapi.ExecutorStreamResponse{}, errStatus
 	}
 	return pluginapi.ExecutorStreamResponse{
 		Headers: http.Header{"Content-Type": []string{"text/event-stream"}},
-		Chunks:  openAIStreamChunks(ctx, resp.Chunks, model, openReq),
+		Chunks:  openAIStreamChunksWithMonitor(ctx, resp.Chunks, model, openReq, span),
 	}, nil
 }
 
@@ -282,6 +307,10 @@ func aggregateOpenAIResponse(body []byte, model string, req openAIRequest) []byt
 }
 
 func openAIStreamChunks(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk, model string, req openAIRequest) <-chan pluginapi.ExecutorStreamChunk {
+	return openAIStreamChunksWithMonitor(ctx, in, model, req, nil)
+}
+
+func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk, model string, req openAIRequest, span *monitor.Span) <-chan pluginapi.ExecutorStreamChunk {
 	out := make(chan pluginapi.ExecutorStreamChunk)
 	go func() {
 		defer close(out)
@@ -304,6 +333,9 @@ func openAIStreamChunks(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk
 		for {
 			select {
 			case <-ctx.Done():
+				if span != nil {
+					span.Finish(monitor.Result{Success: false, Error: ctx.Err().Error()})
+				}
 				out <- pluginapi.ExecutorStreamChunk{Err: ctx.Err()}
 				return
 			case chunk, ok := <-in:
@@ -316,10 +348,16 @@ func openAIStreamChunks(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk
 					if !emit(openAIStreamUsagePayload(streamID, created, model, openAIUsage(promptTokens, completionTokens))) {
 						return
 					}
+					if span != nil {
+						span.Finish(monitor.Result{Success: true, OutputTokens: int64(completionTokens), TotalTokens: int64(promptTokens + completionTokens)})
+					}
 					out <- pluginapi.ExecutorStreamChunk{Payload: []byte("[DONE]")}
 					return
 				}
 				if chunk.Err != nil {
+					if span != nil {
+						span.Finish(monitor.Result{Success: false, Error: chunk.Err.Error()})
+					}
 					out <- pluginapi.ExecutorStreamChunk{Err: chunk.Err}
 					continue
 				}
@@ -333,10 +371,16 @@ func openAIStreamChunks(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk
 					}
 					delta := make(map[string]any)
 					if event.Content != "" {
+						if span != nil {
+							span.MarkTTFT()
+						}
 						delta["content"] = event.Content
 						content.WriteString(event.Content)
 					}
 					if event.ReasoningContent != "" {
+						if span != nil {
+							span.MarkTTFT()
+						}
 						delta["reasoning_content"] = event.ReasoningContent
 						reasoning.WriteString(event.ReasoningContent)
 					}
@@ -351,6 +395,42 @@ func openAIStreamChunks(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk
 		}
 	}()
 	return out
+}
+
+func usageFromOpenAIResponse(payload []byte) monitor.Usage {
+	var body struct {
+		Usage struct {
+			PromptTokens     int64 `json:"prompt_tokens"`
+			CompletionTokens int64 `json:"completion_tokens"`
+			TotalTokens      int64 `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return monitor.Usage{}
+	}
+	return monitor.Usage{
+		InputTokens:  body.Usage.PromptTokens,
+		OutputTokens: body.Usage.CompletionTokens,
+		TotalTokens:  body.Usage.TotalTokens,
+	}
+}
+
+func metadataString(metadata map[string]any, key string) string {
+	if len(metadata) == 0 {
+		return ""
+	}
+	value, ok := metadata[key]
+	if !ok {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case fmt.Stringer:
+		return strings.TrimSpace(typed.String())
+	default:
+		return strings.TrimSpace(fmt.Sprint(typed))
+	}
 }
 
 func openAIStreamUsagePayload(id string, created int64, model string, usage map[string]int) map[string]any {

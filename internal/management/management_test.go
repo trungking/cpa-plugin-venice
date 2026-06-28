@@ -12,6 +12,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	authpkg "github.com/trungking/cpa-plugin-venice/internal/auth"
+	"github.com/trungking/cpa-plugin-venice/internal/monitor"
 )
 
 func TestHandleManagementReturnsVeniceAccountQuota(t *testing.T) {
@@ -218,6 +219,31 @@ func TestCreditQuotaUsesAvailableCreditsAndRefillTime(t *testing.T) {
 	got := progressHTML("Credits", creditAvailable(quota, quotaMetric(quota, []string{"bundledCreditsUsage", "tierCap"})), 100, epochMillisText(nestedValueOrNil(quota, []string{"bundledCreditsUsage", "nextRefillAt"})))
 	if !strings.Contains(got, `95%`) || !strings.Contains(got, `07/19, 11:24`) || !strings.Contains(got, `width:95%`) {
 		t.Fatalf("credit quota html = %s", got)
+	}
+}
+
+func TestRealtimeResourceReturnsMonitorSnapshot(t *testing.T) {
+	monitor.ResetForTest()
+	span := monitor.Start(monitor.RequestInfo{Source: "user@example.com", Model: "zai-org-glm-5.2", InputTokens: 3})
+	span.Finish(monitor.Result{Success: false, Error: "boom", OutputTokens: 0, TotalTokens: 3})
+	resp, err := New().HandleManagementWithHost(context.Background(), pluginapi.ManagementRequest{
+		Method:  http.MethodGet,
+		Path:    "/v0/resource/plugins/cpa-plugin-venice/realtime.json",
+		Headers: http.Header{"Accept": []string{"application/json"}},
+		Query:   url.Values{"failed": []string{"1"}},
+	}, &fakeHost{})
+	if err != nil {
+		t.Fatalf("HandleManagementWithHost error: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d", resp.StatusCode)
+	}
+	var payload monitor.Snapshot
+	if err := json.Unmarshal(resp.Body, &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Summary.Failures != 1 || len(payload.Rows) != 1 || payload.Rows[0].Status != "Failed" {
+		t.Fatalf("payload = %#v", payload)
 	}
 }
 
