@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -168,6 +169,35 @@ func TestOpenAIStreamChunksConvertsToolCall(t *testing.T) {
 	}
 }
 
+func TestOpenAIStreamChunksFlushesToolCallBeforeUpstreamClose(t *testing.T) {
+	in := make(chan pluginapi.HTTPStreamChunk, 1)
+	in <- pluginapi.HTTPStreamChunk{Payload: []byte(
+		`data: {"kind":"content","content":"{\"tool_calls\":[{\"name\":\"list_files\",\"arguments\":{\"path\":\".\"}}]}"}` + "\n",
+	)}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	req := openAIRequest{
+		Model:    "zai-org-glm-5.2",
+		Messages: []openAIMessage{{Role: "user", Content: "inspect"}},
+		Tools: []json.RawMessage{
+			json.RawMessage(`{"type":"function","function":{"name":"list_files"}}`),
+		},
+	}
+	out := openAIStreamChunks(ctx, in, "zai-org-glm-5.2", req)
+	var joined strings.Builder
+	for chunk := range out {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+		joined.Write(chunk.Payload)
+	}
+	if !strings.Contains(joined.String(), `"finish_reason":"tool_calls"`) {
+		t.Fatalf("stream did not flush tool call before upstream close: %s", joined.String())
+	}
+}
+
 func TestOpenAIStreamChunksConvertsToolCallFromReasoning(t *testing.T) {
 	in := make(chan pluginapi.HTTPStreamChunk, 1)
 	in <- pluginapi.HTTPStreamChunk{Payload: []byte(
@@ -257,6 +287,21 @@ func TestAggregateOpenAIResponseWithToolCall(t *testing.T) {
 	}
 	if message["content"] != nil {
 		t.Fatalf("content = %#v, want nil for tool call", message["content"])
+	}
+}
+
+func TestArgumentsStringRepairsWindowsPathJSON(t *testing.T) {
+	raw := `{"filePath":"C:\Users\vhctr\Documents\Codex\go.mod"}`
+	repaired := argumentsString(raw)
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(repaired), &decoded); err != nil {
+		t.Fatalf("repaired arguments are invalid JSON: %s: %v", repaired, err)
+	}
+	if decoded["filePath"] != `C:\Users\vhctr\Documents\Codex\go.mod` {
+		t.Fatalf("filePath = %q", decoded["filePath"])
+	}
+	if _, hasValue := decoded["value"]; hasValue {
+		t.Fatalf("arguments were wrapped as value: %s", repaired)
 	}
 }
 

@@ -351,6 +351,7 @@ If a tool is needed, respond with exactly one JSON object and no markdown, no pr
 {"tool_calls":[{"name":"tool_name","arguments":{}}]}
 The "name" must exactly match one available tool name. The "arguments" value must be a JSON object matching that tool schema.
 Do not answer in natural language when the next step requires a tool. Do not describe the tool; call it with JSON.
+Never say you will inspect, check, search, read, grep, list, or explore something. If that is needed, call a tool in this response.
 After tool results are provided in later messages, answer normally or request another tool with the same JSON format.
 
 Available tools:
@@ -491,6 +492,20 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 							}
 							content.WriteString(event.Content)
 							reasoning.WriteString(event.ReasoningContent)
+							if toolCalls, ok := parseToolCallsFromText(content.String(), reasoning.String()); ok {
+								promptTokens := estimateRequestTokens(req)
+								completionTokens := estimateTokens(content.String()) + estimateTokens(reasoning.String())
+								if !emitToolCallStream(emit, streamID, created, model, toolCalls) {
+									return
+								}
+								if !emit(openAIStreamUsagePayload(streamID, created, model, openAIUsage(promptTokens, completionTokens))) {
+									return
+								}
+								if span != nil {
+									span.Finish(monitor.Result{Success: true, OutputTokens: int64(completionTokens), TotalTokens: int64(promptTokens + completionTokens)})
+								}
+								return
+							}
 						}
 						continue
 					}
@@ -524,23 +539,7 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 
 func emitBufferedToolAwareStream(emit func(map[string]any) bool, streamID string, created int64, model string, req openAIRequest, content, reasoning string) bool {
 	if toolCalls, ok := parseToolCallsFromText(content, reasoning); ok && len(req.Tools) > 0 {
-		for i, call := range toolCalls {
-			delta := map[string]any{
-				"tool_calls": []map[string]any{{
-					"index": i,
-					"id":    call.ID,
-					"type":  firstNonEmpty(call.Type, "function"),
-					"function": map[string]any{
-						"name":      call.Function.Name,
-						"arguments": call.Function.Arguments,
-					},
-				}},
-			}
-			if !emit(openAIStreamPayload(streamID, created, model, delta, nil)) {
-				return false
-			}
-		}
-		return emit(openAIStreamPayload(streamID, created, model, map[string]any{}, "tool_calls"))
+		return emitToolCallStream(emit, streamID, created, model, toolCalls)
 	}
 	delta := make(map[string]any)
 	if content != "" {
@@ -555,6 +554,26 @@ func emitBufferedToolAwareStream(emit func(map[string]any) bool, streamID string
 		}
 	}
 	return emit(openAIStreamPayload(streamID, created, model, map[string]any{}, "stop"))
+}
+
+func emitToolCallStream(emit func(map[string]any) bool, streamID string, created int64, model string, toolCalls []openAIToolCall) bool {
+	for i, call := range toolCalls {
+		delta := map[string]any{
+			"tool_calls": []map[string]any{{
+				"index": i,
+				"id":    call.ID,
+				"type":  firstNonEmpty(call.Type, "function"),
+				"function": map[string]any{
+					"name":      call.Function.Name,
+					"arguments": call.Function.Arguments,
+				},
+			}},
+		}
+		if !emit(openAIStreamPayload(streamID, created, model, delta, nil)) {
+			return false
+		}
+	}
+	return emit(openAIStreamPayload(streamID, created, model, map[string]any{}, "tool_calls"))
 }
 
 func parseToolCallsFromText(content, reasoning string) ([]openAIToolCall, bool) {
@@ -913,6 +932,9 @@ func argumentsString(value any) string {
 		if json.Valid([]byte(text)) {
 			return text
 		}
+		if repaired := repairJSONBackslashes(text); repaired != "" && json.Valid([]byte(repaired)) {
+			return repaired
+		}
 		raw, _ := json.Marshal(map[string]string{"value": text})
 		return string(raw)
 	}
@@ -921,6 +943,54 @@ func argumentsString(value any) string {
 		return "{}"
 	}
 	return string(raw)
+}
+
+func repairJSONBackslashes(text string) string {
+	if !strings.HasPrefix(strings.TrimSpace(text), "{") && !strings.HasPrefix(strings.TrimSpace(text), "[") {
+		return ""
+	}
+	var out strings.Builder
+	out.Grow(len(text) + 8)
+	for i := 0; i < len(text); {
+		ch := text[i]
+		if ch != '\\' {
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		if i+1 >= len(text) {
+			out.WriteString(`\\`)
+			i++
+			continue
+		}
+		next := text[i+1]
+		if strings.ContainsRune(`"\/bfnrt`, rune(next)) {
+			out.WriteByte('\\')
+			out.WriteByte(next)
+			i += 2
+			continue
+		}
+		if next == 'u' && i+5 < len(text) && isHex4(text[i+2:i+6]) {
+			out.WriteString(text[i : i+6])
+			i += 6
+			continue
+		}
+		out.WriteString(`\\`)
+		i++
+	}
+	return out.String()
+}
+
+func isHex4(text string) bool {
+	if len(text) != 4 {
+		return false
+	}
+	for _, ch := range text {
+		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 func openAIUsage(promptTokens, completionTokens int) map[string]int {
