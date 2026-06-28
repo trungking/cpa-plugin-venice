@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	settingspkg "github.com/trungking/cpa-plugin-venice/internal/settings"
 )
 
 func TestBuildVeniceRequestFromOpenAIChat(t *testing.T) {
@@ -89,6 +90,32 @@ func TestBuildVeniceRequestAddsToolInstructions(t *testing.T) {
 	}
 	if !strings.Contains(last["content"].(string), "no thinking text") || !strings.Contains(last["content"].(string), "list_files") {
 		t.Fatalf("last user prompt missing tool instructions: %#v", last["content"])
+	}
+}
+
+func TestToolRepairSettingAddsStrictInstruction(t *testing.T) {
+	settingspkg.Set(settingspkg.Config{ToolRepairEnabled: true})
+	t.Cleanup(func() { settingspkg.Set(settingspkg.Config{}) })
+	req := pluginapi.ExecutorRequest{
+		Model: "zai-org-glm-5-2",
+		Payload: []byte(`{
+			"model":"zai-org-glm-5-2",
+			"messages":[{"role":"user","content":"Inspect files"}],
+			"tools":[{"type":"function","function":{"name":"list_files"}}],
+			"tool_choice":"auto"
+		}`),
+	}
+	_, raw, _, err := buildVeniceRequest(req)
+	if err != nil {
+		t.Fatalf("buildVeniceRequest error: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	systemPrompt := body["systemPrompt"].(string)
+	if !strings.Contains(systemPrompt, "Plugin tool-call repair is enabled") {
+		t.Fatalf("systemPrompt missing repair mode: %s", systemPrompt)
 	}
 }
 

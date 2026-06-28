@@ -13,6 +13,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	authpkg "github.com/trungking/cpa-plugin-venice/internal/auth"
 	"github.com/trungking/cpa-plugin-venice/internal/monitor"
+	settingspkg "github.com/trungking/cpa-plugin-venice/internal/settings"
 )
 
 func TestHandleManagementReturnsVeniceAccountQuota(t *testing.T) {
@@ -112,6 +113,101 @@ func TestRefreshQueryFetchesAndSavesVenicePlan(t *testing.T) {
 	}
 	if saved["account_plan"] != "PRO" {
 		t.Fatalf("saved account_plan = %#v", saved["account_plan"])
+	}
+}
+
+func TestToolRepairSettingIsGlobal(t *testing.T) {
+	settingspkg.Set(settingspkg.Config{})
+	host := &fakeHost{
+		entries: []pluginapi.HostAuthFileEntry{{
+			ID:        "venice-user",
+			AuthIndex: "auth-1",
+			Name:      "venice-user.json",
+			Provider:  "venice",
+		}},
+		auths: map[string]json.RawMessage{
+			"auth-1": []byte(`{"type":"venice","email":"user@example.com","cookie":"__client=secret"}`),
+		},
+	}
+	resp, err := New().HandleManagementWithHost(context.Background(), pluginapi.ManagementRequest{
+		Method:  http.MethodGet,
+		Path:    "/plugins/venice/accounts.json",
+		Query:   url.Values{"tool_repair": []string{"1"}},
+		Headers: http.Header{"Accept": []string{"application/json"}},
+	}, host)
+	if err != nil {
+		t.Fatalf("HandleManagementWithHost error: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d body=%s", resp.StatusCode, string(resp.Body))
+	}
+	if host.savedName != settingspkg.FileName {
+		t.Fatalf("savedName = %q", host.savedName)
+	}
+	var saved map[string]any
+	if err := json.Unmarshal(host.savedJSON, &saved); err != nil {
+		t.Fatalf("decode saved settings: %v", err)
+	}
+	if saved["type"] != settingspkg.Type || saved["tool_repair_enabled"] != true {
+		t.Fatalf("saved settings = %#v", saved)
+	}
+	if _, leaked := saved["cookie"]; leaked {
+		t.Fatalf("settings file should not include account cookie: %s", string(host.savedJSON))
+	}
+	var payload struct {
+		Settings settingspkg.Config `json:"settings"`
+		Accounts []accountSummary   `json:"accounts"`
+	}
+	if err := json.Unmarshal(resp.Body, &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !payload.Settings.ToolRepairEnabled {
+		t.Fatalf("settings = %#v", payload.Settings)
+	}
+	if len(payload.Accounts) != 1 {
+		t.Fatalf("accounts len = %d", len(payload.Accounts))
+	}
+}
+
+func TestSettingsFileDoesNotAppearAsAccount(t *testing.T) {
+	settingspkg.Set(settingspkg.Config{})
+	host := &fakeHost{
+		entries: []pluginapi.HostAuthFileEntry{{
+			ID:        strings.TrimSuffix(settingspkg.FileName, ".json"),
+			AuthIndex: "settings-1",
+			Name:      settingspkg.FileName,
+			Provider:  settingspkg.Type,
+		}, {
+			ID:        "venice-user",
+			AuthIndex: "auth-1",
+			Name:      "venice-user.json",
+			Provider:  "venice",
+		}},
+		auths: map[string]json.RawMessage{
+			"settings-1": settingspkg.Marshal(settingspkg.Config{ToolRepairEnabled: true}),
+			"auth-1":     []byte(`{"type":"venice","email":"user@example.com","cookie":"__client=secret"}`),
+		},
+	}
+	resp, err := New().HandleManagementWithHost(context.Background(), pluginapi.ManagementRequest{
+		Method:  http.MethodGet,
+		Path:    "/plugins/venice/accounts.json",
+		Headers: http.Header{"Accept": []string{"application/json"}},
+	}, host)
+	if err != nil {
+		t.Fatalf("HandleManagementWithHost error: %v", err)
+	}
+	var payload struct {
+		Settings settingspkg.Config `json:"settings"`
+		Accounts []accountSummary   `json:"accounts"`
+	}
+	if err := json.Unmarshal(resp.Body, &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !payload.Settings.ToolRepairEnabled {
+		t.Fatalf("settings = %#v", payload.Settings)
+	}
+	if len(payload.Accounts) != 1 || payload.Accounts[0].Email != "user@example.com" {
+		t.Fatalf("accounts = %#v", payload.Accounts)
 	}
 }
 

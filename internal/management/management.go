@@ -15,6 +15,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	authpkg "github.com/trungking/cpa-plugin-venice/internal/auth"
 	"github.com/trungking/cpa-plugin-venice/internal/monitor"
+	settingspkg "github.com/trungking/cpa-plugin-venice/internal/settings"
 )
 
 const (
@@ -134,14 +135,21 @@ func (p *Provider) HandleManagementWithHost(ctx context.Context, req pluginapi.M
 		}
 		return realtimeHTMLResponse(), nil
 	}
+	pageSettings := loadSettings(ctx, host)
+	if rawSetting := strings.TrimSpace(req.Query.Get("tool_repair")); rawSetting != "" {
+		pageSettings.ToolRepairEnabled = queryBool(url.Values{"tool_repair": []string{rawSetting}}, "tool_repair")
+		if err := saveSettings(ctx, host, pageSettings); err != nil {
+			return jsonResponse(http.StatusBadGateway, map[string]any{"error": err.Error()}), nil
+		}
+	}
 	accounts, err := p.accounts(ctx, host, req.Query.Get("refresh") == "1")
 	if err != nil {
 		return jsonResponse(http.StatusBadGateway, map[string]any{"error": err.Error()}), nil
 	}
 	if wantsJSON(req) {
-		return jsonResponse(http.StatusOK, map[string]any{"provider": authpkg.ProviderKey, "accounts": accounts}), nil
+		return jsonResponse(http.StatusOK, map[string]any{"provider": authpkg.ProviderKey, "settings": pageSettings, "accounts": accounts}), nil
 	}
-	return htmlResponse(accounts), nil
+	return htmlResponse(accounts, pageSettings), nil
 }
 
 func isLoginPath(path string) bool {
@@ -330,6 +338,40 @@ func (p *Provider) accounts(ctx context.Context, host HostClient, refresh bool) 
 	return out, nil
 }
 
+func loadSettings(ctx context.Context, host HostClient) settingspkg.Config {
+	config := settingspkg.Get()
+	if host == nil {
+		return config
+	}
+	entries, err := host.ListAuths(ctx)
+	if err != nil {
+		return config
+	}
+	for _, entry := range entries {
+		if !looksLikeSettingsEntry(entry) || entry.AuthIndex == "" {
+			continue
+		}
+		resp, errGet := host.GetAuth(ctx, entry.AuthIndex)
+		if errGet != nil {
+			continue
+		}
+		if parsed, ok := settingspkg.Parse(resp.JSON); ok {
+			settingspkg.Set(parsed)
+			return parsed
+		}
+	}
+	return config
+}
+
+func saveSettings(ctx context.Context, host HostClient, config settingspkg.Config) error {
+	settingspkg.Set(config)
+	if host == nil {
+		return fmt.Errorf("CLIProxyAPI host callbacks are unavailable for saving Venice settings")
+	}
+	_, err := host.SaveAuth(ctx, settingspkg.FileName, settingspkg.Marshal(config))
+	return err
+}
+
 func storageForEntry(ctx context.Context, host HostClient, authIndex string) (*authpkg.Storage, error) {
 	resp, err := host.GetAuth(ctx, authIndex)
 	if err != nil {
@@ -339,10 +381,20 @@ func storageForEntry(ctx context.Context, host HostClient, authIndex string) (*a
 }
 
 func looksLikeVeniceEntry(entry pluginapi.HostAuthFileEntry) bool {
+	if looksLikeSettingsEntry(entry) {
+		return false
+	}
 	return strings.EqualFold(entry.Provider, authpkg.ProviderKey) ||
 		strings.EqualFold(entry.Type, authpkg.ProviderKey) ||
 		strings.Contains(strings.ToLower(entry.Name), "venice") ||
 		strings.Contains(strings.ToLower(entry.ID), "venice")
+}
+
+func looksLikeSettingsEntry(entry pluginapi.HostAuthFileEntry) bool {
+	return strings.EqualFold(entry.Provider, settingspkg.Type) ||
+		strings.EqualFold(entry.Type, settingspkg.Type) ||
+		strings.EqualFold(entry.Name, settingspkg.FileName) ||
+		strings.EqualFold(entry.ID, strings.TrimSuffix(settingspkg.FileName, ".json"))
 }
 
 func summaryFromEntry(entry pluginapi.HostAuthFileEntry) accountSummary {
@@ -436,13 +488,24 @@ func queryInt(values url.Values, key string, fallback int) int {
 	return parsed
 }
 
-func htmlResponse(accounts []accountSummary) pluginapi.ManagementResponse {
+func htmlResponse(accounts []accountSummary, settings settingspkg.Config) pluginapi.ManagementResponse {
 	var body strings.Builder
 	body.WriteString("<!doctype html><html><head><meta charset=\"utf-8\"><title>Venice Accounts</title>")
-	body.WriteString("<style>:root{color-scheme:dark}*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;padding:24px;color:#e7eaf1;background:#101723;font-size:14px}.page{max-width:1680px;margin:0 auto}.bar{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:18px}.title{display:flex;align-items:center;gap:10px}h1{font-size:18px;line-height:1.2;margin:0;font-weight:800}.count{background:#0f4777;color:#9bd0ff;border-radius:999px;padding:4px 9px;font-weight:800;font-size:12px}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.seg{display:flex;border-radius:9px;overflow:hidden;background:#1e2634;border:1px solid #293346}.seg a,.seg span{display:flex;align-items:center;gap:8px;padding:8px 13px;color:#9da7b8;font-weight:800;font-size:12px;text-decoration:none}.seg .on{background:#12345a;color:#58a8ff}.btn{border:1px solid #4776a8;background:#213a58;color:#dbeafe;border-radius:12px;padding:8px 13px;font-weight:800;text-decoration:none;white-space:nowrap}.grid{display:grid;grid-template-columns:repeat(4,minmax(260px,1fr));gap:16px}.card{background:#151b2a;border:1px solid #293346;border-radius:9px;padding:17px;min-height:224px;box-shadow:0 1px 0 rgba(255,255,255,.03) inset}.top{display:flex;align-items:center;gap:10px;border-bottom:1px dashed #454b59;padding-bottom:13px;margin-bottom:12px}.pill{background:#2732b5;color:#d9ddff;border-radius:999px;padding:5px 11px;font-weight:800;font-size:12px}.account{font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}.muted{color:#8d95a3;font-size:12px}.strong{color:#eef2f8;font-weight:800}.meta{display:flex;gap:8px;align-items:center;margin-bottom:10px}.meter{margin-top:11px}.row{display:flex;align-items:center;justify-content:space-between;margin-bottom:5px}.label{font-weight:800}.pct{font-weight:900}.track{height:8px;background:#243b5b;border-radius:999px;overflow:hidden}.fill{height:100%;border-radius:999px;background:#5ec244}.fill.warn{background:#f0a52c}.fill.bad{background:#fb7185}.buttons{display:flex;justify-content:flex-end;gap:8px;margin-top:13px}.mini{border:1px solid #4776a8;background:#243f62;color:#e6edf8;border-radius:999px;padding:8px 14px;font-weight:800;text-decoration:none}details{margin-top:12px}summary{cursor:pointer;color:#9dc9ff;font-weight:800}pre{max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#0c1220;border:1px solid #2a3447;border-radius:7px;padding:10px;font-size:12px;line-height:1.45}.empty{color:#aeb7c6}@media(max-width:1300px){.grid{grid-template-columns:repeat(3,minmax(260px,1fr))}}@media(max-width:960px){.grid{grid-template-columns:repeat(2,minmax(240px,1fr))}.bar{align-items:flex-start;flex-direction:column}}@media(max-width:620px){body{padding:14px}.grid{grid-template-columns:1fr}}</style>")
+	body.WriteString("<style>:root{color-scheme:dark}*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;padding:24px;color:#e7eaf1;background:#101723;font-size:14px}.page{max-width:1680px;margin:0 auto}.bar{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:18px}.title{display:flex;align-items:center;gap:10px}h1{font-size:18px;line-height:1.2;margin:0;font-weight:800}.count{background:#0f4777;color:#9bd0ff;border-radius:999px;padding:4px 9px;font-weight:800;font-size:12px}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.seg{display:flex;border-radius:9px;overflow:hidden;background:#1e2634;border:1px solid #293346}.seg a,.seg span{display:flex;align-items:center;gap:8px;padding:8px 13px;color:#9da7b8;font-weight:800;font-size:12px;text-decoration:none}.seg .on{background:#12345a;color:#58a8ff}.btn{border:1px solid #4776a8;background:#213a58;color:#dbeafe;border-radius:12px;padding:8px 13px;font-weight:800;text-decoration:none;white-space:nowrap}.btn.off{border-color:#3a4659;background:#1e2634;color:#d9e1ed}.settings{display:flex;align-items:center;justify-content:space-between;gap:16px;border:1px solid #293346;background:#151b2a;border-radius:9px;padding:14px 16px;margin-bottom:16px}.settings-title{font-weight:900}.settings-note{color:#9da7b8;font-size:12px;margin-top:4px}.grid{display:grid;grid-template-columns:repeat(4,minmax(260px,1fr));gap:16px}.card{background:#151b2a;border:1px solid #293346;border-radius:9px;padding:17px;min-height:224px;box-shadow:0 1px 0 rgba(255,255,255,.03) inset}.top{display:flex;align-items:center;gap:10px;border-bottom:1px dashed #454b59;padding-bottom:13px;margin-bottom:12px}.pill{background:#2732b5;color:#d9ddff;border-radius:999px;padding:5px 11px;font-weight:800;font-size:12px}.account{font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}.muted{color:#8d95a3;font-size:12px}.strong{color:#eef2f8;font-weight:800}.meta{display:flex;gap:8px;align-items:center;margin-bottom:10px}.meter{margin-top:11px}.row{display:flex;align-items:center;justify-content:space-between;margin-bottom:5px}.label{font-weight:800}.pct{font-weight:900}.track{height:8px;background:#243b5b;border-radius:999px;overflow:hidden}.fill{height:100%;border-radius:999px;background:#5ec244}.fill.warn{background:#f0a52c}.fill.bad{background:#fb7185}.buttons{display:flex;justify-content:flex-end;gap:8px;margin-top:13px}.mini{border:1px solid #4776a8;background:#243f62;color:#e6edf8;border-radius:999px;padding:8px 14px;font-weight:800;text-decoration:none}details{margin-top:12px}summary{cursor:pointer;color:#9dc9ff;font-weight:800}pre{max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#0c1220;border:1px solid #2a3447;border-radius:7px;padding:10px;font-size:12px;line-height:1.45}.empty{color:#aeb7c6}@media(max-width:1300px){.grid{grid-template-columns:repeat(3,minmax(260px,1fr))}}@media(max-width:960px){.grid{grid-template-columns:repeat(2,minmax(240px,1fr))}.bar,.settings{align-items:flex-start;flex-direction:column}}@media(max-width:620px){body{padding:14px}.grid{grid-template-columns:1fr}}</style>")
 	body.WriteString("</head><body><main class=\"page\"><div class=\"bar\"><div class=\"title\"><h1>Venice Quota</h1><span class=\"count\">")
 	body.WriteString(fmt.Sprint(len(accounts)))
 	body.WriteString("</span></div><div class=\"actions\"><div class=\"seg\"><span class=\"on\">Accounts</span><a href=\"/v0/resource/plugins/cpa-plugin-venice/realtime\">Realtime</a></div><a class=\"btn\" href=\"?refresh=1\">Refresh all credentials</a></div></div>")
+	body.WriteString("<section class=\"settings\"><div><div class=\"settings-title\">Tool-call repair</div><div class=\"settings-note\">Plugin-wide guardrails for Venice tool calls; useful when a model writes pending action text instead of calling a tool.</div></div><a class=\"btn")
+	if !settings.ToolRepairEnabled {
+		body.WriteString(" off")
+	}
+	body.WriteString("\" href=\"?tool_repair=")
+	if settings.ToolRepairEnabled {
+		body.WriteString("0\">Disable")
+	} else {
+		body.WriteString("1\">Enable")
+	}
+	body.WriteString("</a></section>")
 	if len(accounts) == 0 {
 		body.WriteString("<p class=\"empty\">No Venice accounts found.</p></main></body></html>")
 		return pluginapi.ManagementResponse{

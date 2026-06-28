@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	authpkg "github.com/trungking/cpa-plugin-venice/internal/auth"
 	"github.com/trungking/cpa-plugin-venice/internal/monitor"
+	settingspkg "github.com/trungking/cpa-plugin-venice/internal/settings"
 )
 
 const chatURL = "https://outerface.venice.ai/api/inference/chat"
@@ -346,6 +347,10 @@ func toolInstructions(req openAIRequest) string {
 	}
 	toolsRaw, _ := json.Marshal(req.Tools)
 	choiceRaw, _ := json.Marshal(req.ToolChoice)
+	repairMode := ""
+	if settingspkg.Get().ToolRepairEnabled {
+		repairMode = "\nPlugin tool-call repair is enabled. If your draft response is a promise to act next, convert that pending action into the matching tool call JSON instead of sending the promise as text."
+	}
 	return strings.TrimSpace(fmt.Sprintf(`Tool calling is available.
 If a tool is needed, respond with exactly one JSON object and no markdown, no prose, no thinking text, and no surrounding text:
 {"tool_calls":[{"name":"tool_name","arguments":{}}]}
@@ -353,12 +358,13 @@ The "name" must exactly match one available tool name. The "arguments" value mus
 Do not answer in natural language when the next step requires a tool. Do not describe the tool; call it with JSON.
 Never say you will inspect, check, search, read, grep, list, or explore something. If that is needed, call a tool in this response.
 After tool results are provided in later messages, answer normally or request another tool with the same JSON format.
+%s
 
 Available tools:
 %s
 
 tool_choice:
-%s`, string(toolsRaw), string(choiceRaw)))
+%s`, repairMode, string(toolsRaw), string(choiceRaw)))
 }
 
 func aggregateOpenAIResponse(body []byte, model string, req openAIRequest) []byte {
