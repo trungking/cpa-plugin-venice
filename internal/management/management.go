@@ -102,7 +102,6 @@ func (p *Provider) RegisterManagement(context.Context, pluginapi.ManagementRegis
 			Handler:     p,
 		}, {
 			Path:        resourceRealtime,
-			Menu:        "Venice Realtime",
 			Description: "Venice realtime request monitor.",
 			Handler:     p,
 		}, {
