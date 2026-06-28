@@ -67,6 +67,53 @@ func TestHandleManagementReturnsVeniceAccountQuota(t *testing.T) {
 	}
 }
 
+func TestRefreshQueryFetchesAndSavesVenicePlan(t *testing.T) {
+	host := &fakeHost{
+		httpClient: fakeHTTPClient{},
+		entries: []pluginapi.HostAuthFileEntry{{
+			ID:        "venice-user",
+			AuthIndex: "auth-1",
+			Name:      "venice-user.json",
+			Provider:  "venice",
+			Status:    "ok",
+		}},
+		auths: map[string]json.RawMessage{
+			"auth-1": []byte(`{"type":"venice","email":"user@example.com","cookie":"__client=secret","authorization":"Bearer fresh","authorization_expires_at":"2099-01-01T00:00:00Z"}`),
+		},
+	}
+	resp, err := New().HandleManagementWithHost(context.Background(), pluginapi.ManagementRequest{
+		Method:  http.MethodGet,
+		Path:    "/plugins/venice/accounts.json",
+		Query:   url.Values{"refresh": []string{"1"}},
+		Headers: http.Header{"Accept": []string{"application/json"}},
+	}, host)
+	if err != nil {
+		t.Fatalf("HandleManagementWithHost error: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d", resp.StatusCode)
+	}
+	var payload struct {
+		Accounts []accountSummary `json:"accounts"`
+	}
+	if err := json.Unmarshal(resp.Body, &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload.Accounts) != 1 || payload.Accounts[0].AccountPlan != "PRO" {
+		t.Fatalf("accounts = %#v", payload.Accounts)
+	}
+	if host.savedName != "venice-user.json" {
+		t.Fatalf("savedName = %q", host.savedName)
+	}
+	var saved map[string]any
+	if err := json.Unmarshal(host.savedJSON, &saved); err != nil {
+		t.Fatalf("decode saved auth: %v", err)
+	}
+	if saved["account_plan"] != "PRO" {
+		t.Fatalf("saved account_plan = %#v", saved["account_plan"])
+	}
+}
+
 func TestLoginFormPreservesOAuthState(t *testing.T) {
 	resp, err := New().HandleManagementWithHost(context.Background(), pluginapi.ManagementRequest{
 		Method: http.MethodGet,
@@ -209,7 +256,7 @@ func (c fakeHTTPClient) Do(_ context.Context, req pluginapi.HTTPRequest) (plugin
 	case strings.Contains(req.URL, "/tokens?"):
 		return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Headers: http.Header{}, Body: []byte(`{"jwt":"` + testJWT(map[string]any{"exp": time.Now().Add(time.Hour).Unix()}) + `"}`)}, nil
 	case strings.Contains(req.URL, "/api/user/session"):
-		return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Headers: http.Header{}, Body: []byte(`{"token":"` + testJWT(map[string]any{"email": "user@example.com", "accountPlan": "Plus", "bundledCredits": 95}) + `"}`)}, nil
+		return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Headers: http.Header{}, Body: []byte(`{"token":"` + testJWT(map[string]any{"email": "user@example.com", "userType": "PRO", "bundledCredits": 95}) + `"}`)}, nil
 	default:
 		return pluginapi.HTTPResponse{StatusCode: http.StatusNotFound, Body: []byte(`not found`)}, nil
 	}

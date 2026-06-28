@@ -104,7 +104,7 @@ func (p *Provider) HandleManagementWithHost(ctx context.Context, req pluginapi.M
 		}
 		return loginFormResponse("", "", strings.TrimSpace(req.Query.Get("state")), ""), nil
 	}
-	accounts, err := p.accounts(ctx, host)
+	accounts, err := p.accounts(ctx, host, req.Query.Get("refresh") == "1")
 	if err != nil {
 		return jsonResponse(http.StatusBadGateway, map[string]any{"error": err.Error()}), nil
 	}
@@ -248,7 +248,7 @@ func loginSuccessResponse(email, fileName string) pluginapi.ManagementResponse {
 	}
 }
 
-func (p *Provider) accounts(ctx context.Context, host HostClient) ([]accountSummary, error) {
+func (p *Provider) accounts(ctx context.Context, host HostClient, refresh bool) ([]accountSummary, error) {
 	if host == nil {
 		return []accountSummary{}, nil
 	}
@@ -265,6 +265,19 @@ func (p *Provider) accounts(ctx context.Context, host HostClient) ([]accountSumm
 		if entry.AuthIndex != "" {
 			storage, errStorage := storageForEntry(ctx, host, entry.AuthIndex)
 			if errStorage == nil && storage != nil {
+				if refresh && host.HTTPClient() != nil && storage.Cookie != "" {
+					if errRefresh := authpkg.RefreshStorage(ctx, host.HTTPClient(), storage); errRefresh != nil {
+						summary.Status = "error"
+						summary.StatusMessage = errRefresh.Error()
+					} else {
+						auth := authpkg.AuthData(firstNonEmpty(entry.Name, entry.ID), *storage)
+						saveName := firstNonEmpty(entry.Name, auth.FileName)
+						if _, errSave := host.SaveAuth(ctx, saveName, auth.StorageJSON); errSave != nil {
+							summary.Status = "error"
+							summary.StatusMessage = errSave.Error()
+						}
+					}
+				}
 				mergeStorage(&summary, *storage)
 			}
 		}

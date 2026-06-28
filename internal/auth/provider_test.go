@@ -107,7 +107,7 @@ func (c fakeClient) Do(_ context.Context, req pluginapi.HTTPRequest) (pluginapi.
 	case strings.HasPrefix(req.URL, "https://outerface.venice.ai/api/user/session"):
 		return pluginapi.HTTPResponse{
 			StatusCode: 200,
-			Body:       []byte(`{"token":"` + testJWT(map[string]any{"email": "user@example.com", "sub": "user_test", "bundledCredits": float64(95), "bundledCreditsUsage": map[string]any{"availableCredits": float64(95), "monthlyRefillCredits": float64(100)}, "rateLimits": map[string]any{"conversation": map[string]any{"remaining": float64(3600)}}, "veniceCredits": float64(1089), "sessionToken": "redacted-by-filter"}) + `","subscription":{"plan":"pro"}}`),
+			Body:       []byte(`{"token":"` + testJWT(map[string]any{"email": "user@example.com", "sub": "user_test", "userType": "pro", "bundledCredits": float64(95), "bundledCreditsUsage": map[string]any{"availableCredits": float64(95), "monthlyRefillCredits": float64(100)}, "rateLimits": map[string]any{"conversation": map[string]any{"remaining": float64(3600)}}, "veniceCredits": float64(1089), "sessionToken": "redacted-by-filter"}) + `"}`),
 		}, nil
 	default:
 		c.t.Fatalf("unexpected URL %s", req.URL)

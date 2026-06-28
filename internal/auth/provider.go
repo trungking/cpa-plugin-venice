@@ -262,6 +262,9 @@ func RefreshStorage(ctx context.Context, client pluginapi.HostHTTPClient, storag
 		return fmt.Errorf("venice __client cookie is missing")
 	}
 	if freshAuthorization(storage) {
+		if errSession := fetchVeniceUserSession(ctx, client, storage); errSession != nil {
+			return errSession
+		}
 		return nil
 	}
 	sessionID, sessionToken, errClient := clerkClient(ctx, client, storage)
@@ -773,7 +776,7 @@ func walkQuotaMetadata(out map[string]any, path string, value any, depth int) {
 }
 
 func extractPlan(session map[string]any) string {
-	for _, key := range []string{"plan", "tier", "subscriptionPlan", "subscription_plan", "accountPlan", "account_plan"} {
+	for _, key := range []string{"plan", "tier", "subscriptionPlan", "subscription_plan", "accountPlan", "account_plan", "userType", "user_type"} {
 		if value := strings.TrimSpace(stringFromMap(session, key)); value != "" {
 			return value
 		}
